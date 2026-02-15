@@ -26,7 +26,11 @@ class StorageService:
             "voice-recordings",
             "mri-scans",
             "processed",
-            "exports"
+            "exports",
+            # MRI-specific derived artifacts
+            "mri-preprocessed",
+            # Future CAM/XAI artifacts (heatmaps, overlays, metadata)
+            "mri-xai",
         ]
 
         for bucket in buckets:
