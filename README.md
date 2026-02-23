@@ -23,6 +23,49 @@ Raspberry Pi 5 + Docker Compose 환경에서 동작하는 이중(음성/MRI) 인
 | Object Storage | MinIO |
 | Infra | Docker Compose, Nginx |
 
+### 워커 튜닝(안전 설정, 2026-02-22 반영)
+
+파이프라인 로직(피처 추출/모델 추론/DB 저장)은 변경하지 않고, **Celery 실행 파라미터만** 조정 가능하도록 구성했습니다.
+
+- 적용 파일:
+  - `docker/docker-compose.yml` (worker 실행/환경변수)
+  - `src/claude/worker/tasks.py` (Celery 설정 env override)
+
+- 기본 적용값(현재):
+  - `CELERY_WORKER_CONCURRENCY=1`
+  - `CELERY_WORKER_PREFETCH_MULTIPLIER=1`
+  - `CELERY_WORKER_MAX_TASKS_PER_CHILD=5`
+  - `CELERY_TASK_ACKS_LATE=false`
+  - `CELERY_TASK_REJECT_ON_WORKER_LOST=false`
+  - `CELERY_BROKER_POOL_LIMIT=10`
+  - `OMP_NUM_THREADS=2`
+  - `MKL_NUM_THREADS=2`
+  - `OPENBLAS_NUM_THREADS=2`
+
+- 목적:
+  - API 응답성 유지(워커 과점유 완화)
+  - 장시간 처리 시 메모리 누수/누적 리스크 완화(`max-tasks-per-child`)
+  - RPI 8GB 환경에서 스왑 급증/쓰래싱 가능성 완화
+
+- 즉시 반영 방법(워커만 재기동):
+
+```bash
+cd docker
+docker compose --env-file .env up -d worker
+docker compose --env-file .env logs -f worker
+```
+
+- 필요 시 조정 예시(일시적으로 처리량 우선):
+
+```bash
+export CELERY_WORKER_CONCURRENCY=2
+export OMP_NUM_THREADS=2
+export MKL_NUM_THREADS=2
+export OPENBLAS_NUM_THREADS=2
+cd docker
+docker compose --env-file .env up -d worker
+```
+
 ### 프로젝트 구조
 
 ```text

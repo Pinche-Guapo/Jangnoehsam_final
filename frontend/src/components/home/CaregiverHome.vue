@@ -1,4 +1,4 @@
-<script setup>
+﻿<script setup>
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { useCaregiverData } from '@/composables/useCaregiverData';
@@ -117,7 +117,7 @@ const statusIconPath = computed(() => {
       <header class="page-header stagger" style="--delay: 0ms">
         <div class="page-header-copy">
           <p class="hero-caption">보호자 대시보드</p>
-          <h2 class="hero-title">{{ subjectWithRelation }}</h2>
+          <!-- <h2 class="hero-title">{{ subjectWithRelation }}</h2> -->
         </div>
         <div class="status-pill" :class="statusTone">
           <span class="status-dot"></span>

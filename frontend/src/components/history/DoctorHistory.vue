@@ -61,6 +61,7 @@ type BiomarkerRatioDisplayItem = BiomarkerItem & {
   referenceWidthPercent: number;
   markerPercent: number;
   markerColor: string;
+  statusKey: 'good' | 'warn' | 'bad' | 'empty';
   scaleMinLabel: string;
   scaleMaxLabel: string;
 };
@@ -594,6 +595,32 @@ const normalizeAttentionPlane = (value: unknown): AttentionMapItem['plane'] => {
   return 'axial';
 };
 
+const isNotebookAttentionLayout = computed(() => {
+  const method = String(aiAnalysis.value?.xai?.method || '').trim().toLowerCase();
+  return method === 'gradcam3d_notebook';
+});
+
+const resolveAttentionStoragePlane = (plane: AttentionMapItem['plane']): AttentionMapItem['plane'] => {
+  if (!isNotebookAttentionLayout.value) return plane;
+  if (plane === 'axial') return 'sagittal';
+  if (plane === 'sagittal') return 'axial';
+  return 'coronal';
+};
+
+const rewriteAttentionPlaneQuery = (url: string, requestedPlane: AttentionMapItem['plane']) => {
+  const raw = String(url || '').trim();
+  if (!raw) return raw;
+
+  const storagePlane = resolveAttentionStoragePlane(requestedPlane);
+  if (storagePlane === requestedPlane) return raw;
+
+  if (/[?&]plane=/i.test(raw)) {
+    return raw.replace(/([?&]plane=)(axial|coronal|sagittal)/i, `$1${storagePlane}`);
+  }
+
+  return `${raw}${raw.includes('?') ? '&' : '?'}plane=${storagePlane}`;
+};
+
 const labelByAttentionPlane: Record<AttentionMapItem['plane'], string> = {
   axial: 'Axial',
   coronal: 'Coronal',
@@ -614,13 +641,20 @@ const appendCacheVersion = (url: string) => {
   return `${raw}${raw.includes('?') ? '&' : '?'}v=${encodeURIComponent(version)}`;
 };
 
-const parseAttentionMapItems = (maps: Array<any>): AttentionMapItem[] => {
+const parseAttentionMapItems = (
+  maps: Array<any>,
+  options: { rewritePlaneQuery?: boolean } = {}
+): AttentionMapItem[] => {
   const parsed = maps
     .map((item) => {
       if (!item || typeof item !== 'object') return null;
-      const url = appendCacheVersion(String(item.url || item.path || item.image || '').trim());
-      if (!url) return null;
       const plane = normalizeAttentionPlane(item.plane);
+      const baseUrl = String(item.url || item.path || item.image || '').trim();
+      const resolvedUrl = options.rewritePlaneQuery
+        ? rewriteAttentionPlaneQuery(baseUrl, plane)
+        : baseUrl;
+      const url = appendCacheVersion(resolvedUrl);
+      if (!url) return null;
       const label = labelByAttentionPlane[plane];
       return { plane, label, url } as AttentionMapItem;
     })
@@ -639,6 +673,16 @@ const parseAttentionMapItems = (maps: Array<any>): AttentionMapItem[] => {
 };
 
 const originalMaps = computed<AttentionMapItem[]>(() => {
+  const endpointMaps = [
+    { plane: 'axial', label: 'Axial', url: buildMriSliceEndpoint('original-slice', 'axial') },
+    { plane: 'coronal', label: 'Coronal', url: buildMriSliceEndpoint('original-slice', 'coronal') },
+    { plane: 'sagittal', label: 'Sagittal', url: buildMriSliceEndpoint('original-slice', 'sagittal') }
+  ].filter((item): item is AttentionMapItem => Boolean(String(item.url || '').trim()));
+
+  if (endpointMaps.length > 0) {
+    return endpointMaps;
+  }
+
   const maps = ensureArray(aiAnalysis.value?.originalMaps as Array<any> | undefined);
   if (maps.length > 0) {
     return parseAttentionMapItems(maps);
@@ -646,9 +690,9 @@ const originalMaps = computed<AttentionMapItem[]>(() => {
 
   if (originalImage.value) {
     return [
-      { plane: 'axial', label: 'Axial', url: buildMriSliceEndpoint('original-slice', 'axial') || originalImage.value },
-      { plane: 'coronal', label: 'Coronal', url: buildMriSliceEndpoint('original-slice', 'coronal') || originalImage.value },
-      { plane: 'sagittal', label: 'Sagittal', url: buildMriSliceEndpoint('original-slice', 'sagittal') || originalImage.value }
+      { plane: 'axial', label: 'Axial', url: originalImage.value },
+      { plane: 'coronal', label: 'Coronal', url: originalImage.value },
+      { plane: 'sagittal', label: 'Sagittal', url: originalImage.value }
     ];
   }
 
@@ -658,7 +702,7 @@ const originalMaps = computed<AttentionMapItem[]>(() => {
 const attentionMaps = computed<AttentionMapItem[]>(() => {
   const maps = ensureArray(aiAnalysis.value?.attentionMaps as Array<any> | undefined);
   if (maps.length > 0) {
-    return parseAttentionMapItems(maps);
+    return parseAttentionMapItems(maps, { rewritePlaneQuery: true });
   }
 
   if (attentionMap.value) {
@@ -673,7 +717,10 @@ const attentionSlides = computed<AttentionSlideItem[]>(() => {
   const parsedSlides = slides
     .map((slide, index) => {
       if (!slide || typeof slide !== 'object') return null;
-      const views = parseAttentionMapItems(ensureArray(slide.views as Array<any> | undefined));
+      const views = parseAttentionMapItems(
+        ensureArray(slide.views as Array<any> | undefined),
+        { rewritePlaneQuery: true }
+      );
       if (views.length === 0) return null;
       return {
         rank: Number(slide.rank) || index + 1,
@@ -760,8 +807,14 @@ const dataAvailability = computed<DataAvailability>(() => {
 
   const reportCount = mriAnalysis.value?.reports ? Object.keys(mriAnalysis.value.reports).length : 0;
   const visitImageCount = ensureArray(visits.value).filter((visit) => visit?.imageId).length;
-  const mriCount = base.mriCount ?? Math.max(reportCount, visitImageCount);
-  const hasMRI = base.hasMRI ?? (mriCount > 0 || Boolean(mriAnalysis.value?.scanDate));
+  const hasMriPayload = Boolean(
+    mriAnalysis.value?.scanDate ||
+      mriAnalysis.value?.classification ||
+      mriAnalysis.value?.aiAnalysis
+  );
+  const inferredMriCount = hasMriPayload || base.hasMRI ? 1 : 0;
+  const mriCount = base.mriCount ?? Math.max(reportCount, visitImageCount, inferredMriCount);
+  const hasMRI = base.hasMRI ?? (mriCount > 0 || hasMriPayload);
 
   const voiceDataDays = base.voiceDataDays ?? (participationCounts.length ? participationCounts.length * 7 : 0);
 
@@ -818,6 +871,17 @@ const visitOptions = computed<VisitRecordWithImage[]>(() =>
   )
 );
 const selectedVisitImageId = ref('');
+const mriViewSyncEnabled = ref(true);
+const mriViewSyncIcon = computed(() => (mriViewSyncEnabled.value ? '🔗' : '⛓️‍💥'));
+const mriViewSyncButtonLabel = computed(() =>
+  mriViewSyncEnabled.value
+    ? '현재: 슬라이드 같이 넘어가기. 클릭하면 따로 넘어가기로 전환'
+    : '현재: 슬라이드 따로 넘어가기. 클릭하면 같이 넘어가기로 전환'
+);
+
+const toggleMriViewSync = () => {
+  mriViewSyncEnabled.value = !mriViewSyncEnabled.value;
+};
 
 const hasClinicalData = computed(() => dataAvailability.value.hasCognitiveTests);
 const hasVoiceData = computed(() => dataAvailability.value.hasVoiceData);
@@ -1124,7 +1188,7 @@ const apoe4Biomarker = computed(() => {
     label: 'APOE4',
     value: normalizedCount,
     unit: '',
-    displayValue: normalizedCount === null ? '-' : `${normalizedCount}개`,
+    displayValue: normalizedCount === null ? '-' : String(normalizedCount),
     hasValue: normalizedCount !== null
   };
 });
@@ -1264,9 +1328,11 @@ const biomarkerRatioDisplayItems = computed<BiomarkerRatioDisplayItem[]>(() =>
     }
 
     let markerColor = '#b0b8c2';
+    let statusKey: 'good' | 'warn' | 'bad' | 'empty' = 'empty';
     if (hasValue) {
       if (!hasReference || inReference) {
         markerColor = '#198f63';
+        statusKey = 'good';
       } else {
         let severeOutlier = false;
         if (referenceType === 'gte' && referenceMin !== null) severeOutlier = (item.value as number) < referenceMin * 0.8;
@@ -1277,6 +1343,7 @@ const biomarkerRatioDisplayItems = computed<BiomarkerRatioDisplayItem[]>(() =>
           severeOutlier = (item.value as number) < low * 0.8 || (item.value as number) > high * 1.2;
         }
         markerColor = severeOutlier ? '#ef4444' : '#f59e0b';
+        statusKey = severeOutlier ? 'bad' : 'warn';
       }
     }
 
@@ -1287,6 +1354,7 @@ const biomarkerRatioDisplayItems = computed<BiomarkerRatioDisplayItem[]>(() =>
       referenceWidthPercent,
       markerPercent: hasValue ? toPercent(item.value as number) : 0,
       markerColor,
+      statusKey,
       scaleMinLabel: '0',
       scaleMaxLabel: formatRatioScaleValue(scaleMax)
     };
@@ -1533,11 +1601,6 @@ const handleDiagnosisSubmit = (data: any) => {
   console.log('진단 데이터 제출:', data);
 };
 
-const handleSendDiagnosis = () => {
-  if (!currentPatient.value?.id) return;
-  console.log('진단 결과 전달:', currentPatient.value.id);
-};
-
 watch(
   () => visitOptions.value,
   (value) => {
@@ -1735,7 +1798,12 @@ watch(
                 </div>
 
                 <div class="biomarker-grid biomarker-grid--ratio">
-                  <div v-for="item in biomarkerRatioDisplayItems" :key="item.id" class="biomarker-item">
+                  <div
+                    v-for="item in biomarkerRatioDisplayItems"
+                    :key="item.id"
+                    class="biomarker-item"
+                    :class="`biomarker-item--${item.statusKey}`"
+                  >
                     <span class="biomarker-label">{{ item.label }}</span>
                     <strong class="biomarker-value">
                       {{ formatBiomarkerValue(item.value, item.unit ? 1 : 2) }}
@@ -1962,13 +2030,25 @@ watch(
 
             <div class="mri-analysis-grid">
               <div class="card mri-images-card">
-                <h4>MRI 이미지</h4>
+                <div class="mri-images-header">
+                  <h4>MRI 이미지</h4>
+                  <button
+                    type="button"
+                    class="mri-sync-toggle"
+                    :aria-label="mriViewSyncButtonLabel"
+                    :title="mriViewSyncButtonLabel"
+                    @click="toggleMriViewSync"
+                  >
+                    {{ mriViewSyncIcon }}
+                  </button>
+                </div>
                 <MRIImageDisplay
                   :original-image="originalImage"
                   :original-maps="originalMaps"
                   :attention-map="attentionMap"
                   :attention-maps="attentionMaps"
                   :attention-slides="attentionSlides"
+                  :view-sync-enabled="mriViewSyncEnabled"
                   :loading="isLoading"
                 />
                 <div v-if="visitOptions.length > 0" class="visit-selector-row">
@@ -1996,15 +2076,6 @@ watch(
               @submit="handleDiagnosisSubmit"
             />
 
-            <div class="card mri-action-card">
-              <div>
-                <h4>진단 결과 전달</h4>
-                <p>확정된 진단 결과를 챗봇 및 모델 학습 파이프라인으로 전달합니다.</p>
-              </div>
-              <button type="button" class="mri-action-button" @click="handleSendDiagnosis">
-                진단 결과 전달
-              </button>
-            </div>
           </template>
         </section>
       </div>
@@ -2480,9 +2551,27 @@ watch(
   border-radius: 16px;
   padding: 14px;
   box-shadow: inset 3px 3px 8px rgba(209, 217, 230, 0.5), inset -3px -3px 8px #ffffff;
+  border: 1px solid rgba(76, 183, 183, 0.24);
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+
+.biomarker-item--good {
+  border-color: rgba(76, 183, 183, 0.35);
+}
+
+.biomarker-item--warn {
+  border-color: rgba(255, 183, 77, 0.45);
+}
+
+.biomarker-item--bad {
+  border-color: rgba(255, 138, 128, 0.45);
+}
+
+.biomarker-item--empty {
+  border-style: dashed;
+  border-color: rgba(0, 0, 0, 0.08);
 }
 
 .biomarker-label {
@@ -2884,8 +2973,40 @@ watch(
   gap: 20px;
 }
 
+.mri-images-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .mri-images-card h4 {
   margin-bottom: 4px;
+}
+
+.mri-sync-toggle {
+  width: 42px;
+  height: 42px;
+  border-radius: 999px;
+  border: 1px solid #c8d2dd;
+  background: #f6f8fb;
+  color: #5a6a7f;
+  font-size: 20px;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: inset 2px 2px 5px rgba(209, 217, 230, 0.6), inset -2px -2px 5px #ffffff;
+}
+
+.mri-sync-toggle:hover {
+  background: #eef3f8;
+}
+
+.mri-sync-toggle:focus-visible {
+  outline: 2px solid #4cb7b7;
+  outline-offset: 2px;
 }
 
 .contribution-card {
@@ -2919,36 +3040,6 @@ watch(
   font-size: 15px;
   font-weight: 700;
   color: #2e2e2e;
-}
-
-.mri-action-card {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-}
-
-.mri-action-card p {
-  margin: 6px 0 0;
-  font-size: 14px;
-  font-weight: 700;
-  color: #777;
-}
-
-.mri-action-button {
-  padding: 14px 22px;
-  border-radius: 16px;
-  border: none;
-  background: #4cb7b7;
-  color: #ffffff;
-  font-size: 15px;
-  font-weight: 900;
-  cursor: pointer;
-  box-shadow: 6px 6px 12px #d1d9e6, -6px -6px 12px #ffffff;
-}
-
-.mri-action-button:hover {
-  background: #3da5a5;
 }
 
 .fade-enter-active,
@@ -3004,15 +3095,6 @@ watch(
   .mri-context-meta {
     width: 100%;
     justify-content: space-between;
-  }
-
-  .mri-action-card {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .mri-action-button {
-    width: 100%;
   }
 
   .visit-selector-row {

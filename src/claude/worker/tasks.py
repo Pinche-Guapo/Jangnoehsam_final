@@ -29,6 +29,24 @@ def _kst_now_naive() -> datetime:
     """Return current Korea time as naive datetime for TIMESTAMP columns."""
     return datetime.now(KST).replace(tzinfo=None)
 
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning(f"Invalid int for {name}={raw!r}; fallback={default}")
+        return default
+
+
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
 # Initialize Celery app
 app = Celery(
     'mci-worker',
@@ -37,6 +55,8 @@ app = Celery(
 )
 
 # Configure Celery
+_worker_prefetch = _int_env("CELERY_WORKER_PREFETCH_MULTIPLIER", 1)
+_worker_max_tasks = _int_env("CELERY_WORKER_MAX_TASKS_PER_CHILD", 0)
 app.conf.update(
     task_serializer='json',
     accept_content=['json'],
@@ -45,7 +65,11 @@ app.conf.update(
     enable_utc=False,
     task_track_started=True,
     task_time_limit=3600,  # 1 hour max per task
-    worker_prefetch_multiplier=1,  # Process one task at a time
+    worker_prefetch_multiplier=_worker_prefetch,  # Process one task at a time by default
+    worker_max_tasks_per_child=(_worker_max_tasks if _worker_max_tasks > 0 else None),
+    task_acks_late=_bool_env("CELERY_TASK_ACKS_LATE", False),
+    task_reject_on_worker_lost=_bool_env("CELERY_TASK_REJECT_ON_WORKER_LOST", False),
+    broker_pool_limit=_int_env("CELERY_BROKER_POOL_LIMIT", 10),
 )
 
 # Define MRI Template path relative to this file
@@ -598,6 +622,7 @@ def process_mri_scan(self, mri_id: str, patient_id: str, file_path: str):
         # Resolve persistent object identity and local cache path.
         preprocessed_dir = _get_preprocessed_dir()
         preprocessed_bucket = _get_preprocessed_bucket()
+        source_file_reference = str(file_path).strip() if file_path else None
         subject_token = (
             (str(subject_id).strip() if subject_id else None)
             or _extract_subject_id_from_path(file_path)
@@ -718,6 +743,8 @@ def process_mri_scan(self, mri_id: str, patient_id: str, file_path: str):
             "pipeline": "dig_help_cascade_cam",
             "generatedAt": _kst_now_naive().isoformat(),
             "modelVersion": model_version,
+            "sourceFilePath": source_file_reference,
+            "preprocessedObjectPath": stored_file_path,
             "regionContributions": region_contributions,
             "xai": {
                 "method": xai_payload.get("method"),
@@ -875,7 +902,7 @@ def process_mri_scan(self, mri_id: str, patient_id: str, file_path: str):
                 model_version,
                 json.dumps(region_contributions),
                 json.dumps(ai_analysis),
-                stored_file_path,
+                source_file_reference or stored_file_path,
                 mri_id,
             ))
             conn.commit()

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, onBeforeUnmount } from 'vue';
 
 interface DiagnosisOption {
   id: string;
@@ -31,6 +31,9 @@ const emit = defineEmits<{
   (e: 'submit', data: DiagnosisSubmitData): void;
 }>();
 
+const API_BASE_RAW = (import.meta.env.VITE_API_BASE_URL || '/api').replace(/\/$/, '');
+const API_BASE = /\/api$/i.test(API_BASE_RAW) ? API_BASE_RAW : `${API_BASE_RAW}/api`;
+
 // 진단 옵션 목록
 const diagnosisOptions: DiagnosisOption[] = [
   { id: 'hippocampus', label: '해마 위축', value: 'hippocampus_atrophy' },
@@ -53,6 +56,28 @@ const selectedStage = ref('');
 const selectedDiagnoses = ref<string[]>([]);
 const additionalNotes = ref('');
 const isSubmitting = ref(false);
+const toastVisible = ref(false);
+const toastMessage = ref('');
+const toastType = ref<'success' | 'error'>('success');
+let toastTimer: ReturnType<typeof setTimeout> | null = null;
+
+const showToast = (message: string, type: 'success' | 'error' = 'success') => {
+  toastMessage.value = message;
+  toastType.value = type;
+  toastVisible.value = true;
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+  }
+  toastTimer = setTimeout(() => {
+    toastVisible.value = false;
+  }, 2200);
+};
+
+onBeforeUnmount(() => {
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+  }
+});
 
 // 유효성 검사
 const isValid = computed(() => Boolean(selectedStage.value) && selectedDiagnoses.value.length > 0);
@@ -71,7 +96,7 @@ const handleCheckboxChange = (value: string) => {
 const isChecked = (value: string) => selectedDiagnoses.value.includes(value);
 const isStageSelected = (value: string) => selectedStage.value === value;
 const handleStageSelect = (value: string) => {
-  selectedStage.value = value;
+  selectedStage.value = selectedStage.value === value ? '' : value;
 };
 
 // 폼 초기화
@@ -86,12 +111,12 @@ const handleSubmit = async (e: Event) => {
   e.preventDefault();
 
   if (!selectedStage.value) {
-    alert('CN / sMCI / pMCI / AD 중 하나를 선택해주세요.');
+    showToast('CN / sMCI / pMCI / AD 중 하나를 선택해주세요.', 'error');
     return;
   }
 
   if (selectedDiagnoses.value.length === 0) {
-    alert('최소 하나 이상의 진단 항목을 선택해주세요.');
+    showToast('최소 하나 이상의 진단 항목을 선택해주세요.', 'error');
     return;
   }
 
@@ -107,19 +132,48 @@ const handleSubmit = async (e: Event) => {
       doctorId: props.doctorId || 'doctor_001'
     };
 
-    // API 호출 시뮬레이션 (실제 구현 시 fetch로 교체)
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    const response = await fetch(
+      `${API_BASE}/doctor/patients/${encodeURIComponent(String(props.patientId))}/mri/doctor-diagnosis`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        credentials: 'include',
+        body: JSON.stringify({
+          diagnoses: submitData.diagnoses,
+          stage: submitData.stage,
+          additionalNotes: submitData.additionalNotes,
+          timestamp: submitData.timestamp,
+          doctorId: submitData.doctorId
+        })
+      }
+    );
+
+    if (!response.ok) {
+      let detail = '진단 저장 중 오류가 발생했습니다.';
+      try {
+        const body = await response.json();
+        if (typeof body?.detail === 'string' && body.detail.trim()) {
+          detail = body.detail.trim();
+        }
+      } catch {
+        // ignore parse error
+      }
+      throw new Error(`${detail} (HTTP ${response.status})`);
+    }
 
     // 부모 컴포넌트에 이벤트 전달
     emit('submit', submitData);
 
-    alert('진단이 성공적으로 저장되었습니다.');
+    showToast('진단 결과가 저장되었습니다.', 'success');
 
     // 폼 초기화
     handleReset();
-  } catch (error) {
+  } catch (error: unknown) {
     console.error('진단 저장 실패:', error);
-    alert('진단 저장 중 오류가 발생했습니다.');
+    const message = error instanceof Error ? error.message : '진단 저장 중 오류가 발생했습니다.';
+    showToast(message, 'error');
   } finally {
     isSubmitting.value = false;
   }
@@ -209,6 +263,18 @@ const handleSubmit = async (e: Event) => {
         </button>
       </div>
     </form>
+
+    <transition name="toast-fade">
+      <div
+        v-if="toastVisible"
+        class="form-toast"
+        :class="`is-${toastType}`"
+        role="status"
+        aria-live="polite"
+      >
+        {{ toastMessage }}
+      </div>
+    </transition>
   </div>
 </template>
 
@@ -449,6 +515,46 @@ const handleSubmit = async (e: Event) => {
   border-top-color: #ffffff;
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+
+.form-toast {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2200;
+  padding: 14px 20px;
+  border-radius: 14px;
+  font-size: 16px;
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  box-shadow: 0 16px 34px rgba(30, 41, 59, 0.24);
+  border: 1px solid transparent;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.form-toast.is-success {
+  color: #1f7f7f;
+  background: #e8f7f7;
+  border-color: rgba(76, 183, 183, 0.45);
+}
+
+.form-toast.is-error {
+  color: #9a3412;
+  background: #fff5ec;
+  border-color: rgba(251, 146, 60, 0.45);
+}
+
+.toast-fade-enter-active,
+.toast-fade-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+}
+
+.toast-fade-enter-from,
+.toast-fade-leave-to {
+  opacity: 0;
+  transform: translate(-50%, calc(-50% + 8px));
 }
 
 @keyframes spin {

@@ -107,13 +107,29 @@ services:
       - MRI_AXIAL_SLICE_SHIFT=3
       - MCI_SUBTYPE_MODEL_PATH=/models/mci_model_best_v2.cbm
       - MCI_SUBTYPE_MODEL_DIR=/models/mci(s,p)
-      - OMP_NUM_THREADS=4
-      - MKL_NUM_THREADS=4
-      - OPENBLAS_NUM_THREADS=4
+      - CELERY_LOGLEVEL=${CELERY_LOGLEVEL:-info}
+      - CELERY_WORKER_CONCURRENCY=${CELERY_WORKER_CONCURRENCY:-1}
+      - CELERY_WORKER_PREFETCH_MULTIPLIER=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
+      - CELERY_WORKER_MAX_TASKS_PER_CHILD=${CELERY_WORKER_MAX_TASKS_PER_CHILD:-5}
+      - CELERY_TASK_ACKS_LATE=${CELERY_TASK_ACKS_LATE:-false}
+      - CELERY_TASK_REJECT_ON_WORKER_LOST=${CELERY_TASK_REJECT_ON_WORKER_LOST:-false}
+      - CELERY_BROKER_POOL_LIMIT=${CELERY_BROKER_POOL_LIMIT:-10}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS:-2}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS:-2}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS:-2}
     volumes:
       - ../models:/models:ro
       - ../data:/app/data
       - ../minio-data:/app/minio-data
+    command:
+      - sh
+      - -c
+      - >
+        uv run celery -A src.claude.worker.tasks worker
+        --loglevel=${CELERY_LOGLEVEL:-info}
+        --concurrency=${CELERY_WORKER_CONCURRENCY:-1}
+        --prefetch-multiplier=${CELERY_WORKER_PREFETCH_MULTIPLIER:-1}
+        --max-tasks-per-child=${CELERY_WORKER_MAX_TASKS_PER_CHILD:-5}
     depends_on:
       postgres:
         condition: service_healthy

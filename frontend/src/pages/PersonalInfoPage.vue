@@ -19,12 +19,23 @@ const phoneNumber = ref(
   || localStorage.getItem('user-phone')
   || ''
 );
-const avatarUrl = ref(
+const initialAvatarUrl = (
   authStore.user?.profile_image_url
   || authStore.user?.profileImageUrl
   || localStorage.getItem('user-avatar')
   || null
 );
+
+// Remove only locally uploaded photo(data URI), keep server-side profile URLs intact.
+const avatarUrl = ref(
+  typeof initialAvatarUrl === 'string' && initialAvatarUrl.startsWith('data:')
+    ? null
+    : initialAvatarUrl
+);
+
+if (typeof initialAvatarUrl === 'string' && initialAvatarUrl.startsWith('data:')) {
+  localStorage.removeItem('user-avatar');
+}
 const memberActionMessage = ref('');
 const saveMessage = ref('');
 const MEMBER_CODE_MODULUS = 1000000;
@@ -120,6 +131,8 @@ const saveChanges = async () => {
   }
   if (avatarUrl.value) {
     localStorage.setItem('user-avatar', avatarUrl.value);
+  } else {
+    localStorage.removeItem('user-avatar');
   }
 
   try {

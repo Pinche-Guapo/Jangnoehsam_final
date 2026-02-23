@@ -60,16 +60,16 @@ onMounted(() => {
       </section>
 
       <section class="settings-cards">
-        <button class="settings-card" @click="goToPersonalInfo">
+        <button class="settings-card profile-card" @click="goToPersonalInfo">
           <div class="card-icon">
-            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="#4cb7b7" stroke-width="2">
+            <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#4cb7b7" stroke-width="2.2">
               <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
               <circle cx="12" cy="7" r="4"/>
             </svg>
           </div>
           <div class="card-content">
-            <h3>{{ role === 'subject' ? '대상자 프로필' : '개인정보 수정' }}</h3>
-            <p>{{ role === 'subject' ? '이름, 연락처, 대상자 회원번호 확인' : '이름, 연락처, 기본 프로필 관리' }}</p>
+            <h3>개인정보 수정</h3>
+            <p>이름, 연락처, 기본 프로필 관리</p>
           </div>
           <svg class="chevron" width="24" height="24" viewBox="0 0 24 24">
             <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6z" fill="#aaa"/>
@@ -206,6 +206,31 @@ onMounted(() => {
   cursor: pointer;
   transition: transform 0.2s ease, box-shadow 0.2s ease;
   text-align: left;
+}
+
+.profile-card {
+  gap: 16px;
+  padding: 20px 24px;
+  border-radius: 24px;
+}
+
+.profile-card .card-icon {
+  width: 80px;
+  height: 80px;
+  min-width: 80px;
+  border-radius: 22px;
+}
+
+.profile-card .card-content h3 {
+  font-size: 20px;
+  line-height: 1.2;
+  margin: 0 0 8px;
+}
+
+.profile-card .card-content p {
+  font-size: 15px;
+  line-height: 1.35;
+  max-width: 280px;
 }
 
 .settings-card:active {

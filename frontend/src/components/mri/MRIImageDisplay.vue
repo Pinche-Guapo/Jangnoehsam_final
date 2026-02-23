@@ -38,6 +38,7 @@ const props = defineProps<{
   attentionMap?: string;
   attentionMaps?: AttentionMapInput[];
   attentionSlides?: AttentionSlideInput[];
+  viewSyncEnabled?: boolean;
   loading?: boolean;
 }>();
 
@@ -45,6 +46,8 @@ const failedOriginalUrls = ref<string[]>([]);
 const failedAttentionUrls = ref<string[]>([]);
 const selectedSlideIndex = ref(0);
 const selectedViewIndex = ref(0);
+const selectedOriginalViewIndex = ref(0);
+const isViewSyncEnabled = computed(() => props.viewSyncEnabled !== false);
 
 const planeOrder: Record<AttentionMapItem['plane'], number> = {
   axial: 0,
@@ -66,19 +69,13 @@ const resolveAttentionLabel = (plane: AttentionMapItem['plane']) => {
   return 'Axial';
 };
 
-const parseMapItems = (maps: AttentionMapInput[], options?: { swapAxialSagittal?: boolean }) => {
+const parseMapItems = (maps: AttentionMapInput[]) => {
   const parsed = maps
     .map((item) => {
       if (!item || typeof item !== 'object') return null;
       const url = String(item.url || item.path || item.image || '').trim();
       if (!url) return null;
-      let plane = normalizePlane(item.plane);
-      // CAM artifact in current pipeline is exported with axial/sagittal swapped.
-      // Hard-map here so UI label/order matches the actual anatomical view.
-      if (options?.swapAxialSagittal) {
-        if (plane === 'axial') plane = 'sagittal';
-        else if (plane === 'sagittal') plane = 'axial';
-      }
+      const plane = normalizePlane(item.plane);
       return {
         plane,
         label: resolveAttentionLabel(plane),
@@ -101,7 +98,7 @@ const parseMapItems = (maps: AttentionMapInput[], options?: { swapAxialSagittal?
 
 const fallbackAttentionMaps = computed<AttentionMapItem[]>(() => {
   const provided = Array.isArray(props.attentionMaps) ? props.attentionMaps : [];
-  const parsed = parseMapItems(provided, { swapAxialSagittal: true });
+  const parsed = parseMapItems(provided);
   if (parsed.length > 0) return parsed;
 
   const single = String(props.attentionMap || '').trim();
@@ -124,7 +121,7 @@ const resolvedAttentionSlides = computed<AttentionSlideItem[]>(() => {
   const parsed = sourceSlides
     .map((slide, index) => {
       if (!slide || typeof slide !== 'object') return null;
-      const views = parseMapItems(Array.isArray(slide.views) ? slide.views : [], { swapAxialSagittal: true });
+      const views = parseMapItems(Array.isArray(slide.views) ? slide.views : []);
       if (views.length === 0) return null;
       const rankValue = Number(slide.rank);
       return {
@@ -178,13 +175,24 @@ const currentAttentionView = computed<AttentionMapItem | null>(() => {
 const currentOriginalView = computed<AttentionMapItem | null>(() => {
   if (!fallbackOriginalMaps.value.length) return null;
 
-  const targetPlane = currentAttentionView.value?.plane;
-  if (targetPlane) {
-    const matched = fallbackOriginalMaps.value.find((item) => item.plane === targetPlane);
-    if (matched) return matched;
+  if (isViewSyncEnabled.value) {
+    const targetPlane = currentAttentionView.value?.plane;
+    if (targetPlane) {
+      const matched = fallbackOriginalMaps.value.find((item) => item.plane === targetPlane);
+      if (matched) return matched;
+    }
+
+    const syncIndex = Math.min(
+      Math.max(selectedViewIndex.value, 0),
+      fallbackOriginalMaps.value.length - 1
+    );
+    return fallbackOriginalMaps.value[syncIndex] || fallbackOriginalMaps.value[0];
   }
 
-  const index = Math.min(Math.max(selectedViewIndex.value, 0), fallbackOriginalMaps.value.length - 1);
+  const index = Math.min(
+    Math.max(selectedOriginalViewIndex.value, 0),
+    fallbackOriginalMaps.value.length - 1
+  );
   return fallbackOriginalMaps.value[index] || fallbackOriginalMaps.value[0];
 });
 
@@ -221,6 +229,37 @@ watch(
 );
 
 watch(
+  () => fallbackOriginalMaps.value.length,
+  (length) => {
+    if (!length) {
+      selectedOriginalViewIndex.value = 0;
+      return;
+    }
+    if (selectedOriginalViewIndex.value >= length) {
+      selectedOriginalViewIndex.value = length - 1;
+    }
+  },
+  { immediate: true }
+);
+
+watch(
+  isViewSyncEnabled,
+  (enabled, previous) => {
+    if (enabled || !previous) return;
+    const targetPlane = currentAttentionView.value?.plane;
+    if (!targetPlane) {
+      selectedOriginalViewIndex.value = Math.min(
+        Math.max(selectedViewIndex.value, 0),
+        Math.max(fallbackOriginalMaps.value.length - 1, 0)
+      );
+      return;
+    }
+    const matchedIndex = fallbackOriginalMaps.value.findIndex((item) => item.plane === targetPlane);
+    selectedOriginalViewIndex.value = matchedIndex >= 0 ? matchedIndex : 0;
+  }
+);
+
+watch(
   () => attentionViews.value.length,
   (length) => {
     if (!length) {
@@ -236,11 +275,21 @@ watch(
 
 const hasOriginalImage = (url: string) => Boolean(url && !failedOriginalUrls.value.includes(url));
 const hasOriginal = computed(() => Boolean(currentOriginalView.value?.url) && hasOriginalImage(currentOriginalView.value?.url || ''));
-const hasViewPaging = computed(() => attentionViews.value.length > 1);
-const viewPositionLabel = computed(() => {
+const hasAttentionViewPaging = computed(() => attentionViews.value.length > 1);
+const hasOriginalViewPaging = computed(() => {
+  return isViewSyncEnabled.value ? hasAttentionViewPaging.value : fallbackOriginalMaps.value.length > 1;
+});
+const attentionViewPositionLabel = computed(() => {
   const total = attentionViews.value.length || fallbackOriginalMaps.value.length;
   if (!total) return '0 / 0';
   const current = Math.min(Math.max(selectedViewIndex.value, 0), total - 1) + 1;
+  return `${current} / ${total}`;
+});
+const originalViewPositionLabel = computed(() => {
+  if (isViewSyncEnabled.value) return attentionViewPositionLabel.value;
+  const total = fallbackOriginalMaps.value.length;
+  if (!total) return '0 / 0';
+  const current = Math.min(Math.max(selectedOriginalViewIndex.value, 0), total - 1) + 1;
   return `${current} / ${total}`;
 });
 
@@ -260,16 +309,36 @@ const handleAttentionError = (url: string) => {
 
 const hasViewImage = (url: string) => Boolean(url && !failedAttentionUrls.value.includes(url));
 
-const goPrevView = () => {
+const goPrevAttentionView = () => {
   const total = attentionViews.value.length;
   if (!total) return;
   selectedViewIndex.value = (selectedViewIndex.value - 1 + total) % total;
 };
 
-const goNextView = () => {
+const goNextAttentionView = () => {
   const total = attentionViews.value.length;
   if (!total) return;
   selectedViewIndex.value = (selectedViewIndex.value + 1) % total;
+};
+
+const goPrevOriginalView = () => {
+  if (isViewSyncEnabled.value) {
+    goPrevAttentionView();
+    return;
+  }
+  const total = fallbackOriginalMaps.value.length;
+  if (!total) return;
+  selectedOriginalViewIndex.value = (selectedOriginalViewIndex.value - 1 + total) % total;
+};
+
+const goNextOriginalView = () => {
+  if (isViewSyncEnabled.value) {
+    goNextAttentionView();
+    return;
+  }
+  const total = fallbackOriginalMaps.value.length;
+  if (!total) return;
+  selectedOriginalViewIndex.value = (selectedOriginalViewIndex.value + 1) % total;
 };
 </script>
 
@@ -286,10 +355,6 @@ const goNextView = () => {
           <template v-else-if="hasOriginal && currentOriginalView">
             <img
               :key="`original-${currentOriginalView.plane}-${currentOriginalView.url}`"
-              :class="{
-                'original-rotated-180':
-                  currentOriginalView.plane === 'coronal' || currentOriginalView.plane === 'sagittal'
-              }"
               :src="currentOriginalView.url"
               :alt="`Original MRI ${currentOriginalView.label}`"
               loading="lazy"
@@ -305,21 +370,21 @@ const goNextView = () => {
             type="button"
             class="pager-button"
             aria-label="원본 이전 단면"
-            :disabled="!hasViewPaging"
-            @click="goPrevView"
+            :disabled="!hasOriginalViewPaging"
+            @click="goPrevOriginalView"
           >
             ‹
           </button>
           <div class="attention-view-meta original-view-meta">
-            <strong>{{ currentAttentionView?.label || currentOriginalView?.label || 'Axial' }}</strong>
-            <span class="pager-index">{{ viewPositionLabel }}</span>
+            <strong>{{ currentOriginalView?.label || currentAttentionView?.label || 'Axial' }}</strong>
+            <span class="pager-index">{{ originalViewPositionLabel }}</span>
           </div>
           <button
             type="button"
             class="pager-button"
             aria-label="원본 다음 단면"
-            :disabled="!hasViewPaging"
-            @click="goNextView"
+            :disabled="!hasOriginalViewPaging"
+            @click="goNextOriginalView"
           >
             ›
           </button>
@@ -353,21 +418,21 @@ const goNextView = () => {
             type="button"
             class="pager-button"
             aria-label="이전 단면"
-            :disabled="!hasViewPaging"
-            @click="goPrevView"
+            :disabled="!hasAttentionViewPaging"
+            @click="goPrevAttentionView"
           >
             ‹
           </button>
           <div class="attention-view-meta">
             <strong>{{ currentAttentionView?.label || 'Axial' }}</strong>
-            <span class="pager-index">{{ viewPositionLabel }}</span>
+            <span class="pager-index">{{ attentionViewPositionLabel }}</span>
           </div>
           <button
             type="button"
             class="pager-button"
             aria-label="다음 단면"
-            :disabled="!hasViewPaging"
-            @click="goNextView"
+            :disabled="!hasAttentionViewPaging"
+            @click="goNextAttentionView"
           >
             ›
           </button>

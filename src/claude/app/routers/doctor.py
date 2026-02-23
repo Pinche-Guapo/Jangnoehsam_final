@@ -24,8 +24,9 @@ from ..storage import storage
 
 router = APIRouter(prefix="/api/doctor", tags=["doctor"])
 logger = logging.getLogger(__name__)
-MRI_RENDER_VERSION = "20260220-1"
+MRI_RENDER_VERSION = "20260222-1"
 SUBJECT_ID_PATTERN = re.compile(r"(\d{3}_S_\d{4})", re.IGNORECASE)
+PATIENT_ALIAS_USER_ID_PATTERN = re.compile(r"^P(?P<uid>\d+)(?:[_-].*)?$", re.IGNORECASE)
 MRI_DIAGNOSIS_COLUMN_MAP: Dict[str, str] = {
     "hippocampus_atrophy": "hippocampal_atrophy",
     "temporal_lobe_atrophy": "medial_temporal_atrophy",
@@ -191,6 +192,28 @@ def _extract_subject_id_from_text(value: Optional[str]) -> Optional[str]:
     return matched.group(0).upper()
 
 
+def _patient_lookup_tokens(patient_id: str) -> List[str]:
+    """
+    Build lookup tokens for endpoints that accept subject_id or user_id.
+
+    Supports aliases like:
+    - P109_DONGGOON
+    - P109
+    by additionally mapping them to user_id text ("109").
+    """
+    raw = str(patient_id or "").strip()
+    if not raw:
+        return []
+
+    tokens: List[str] = [raw]
+    matched = PATIENT_ALIAS_USER_ID_PATTERN.match(raw)
+    if matched:
+        uid_token = matched.group("uid").lstrip("0") or "0"
+        if uid_token not in tokens:
+            tokens.append(uid_token)
+    return tokens
+
+
 def _resolve_bucket_and_key(path: str, default_bucket: str = "mri-xai"):
     raw = str(path or "").strip().replace("s3://", "")
     if not raw:
@@ -332,6 +355,10 @@ def _resolve_attention_map_object(
 
 
 async def _resolve_mri_subject_id(patient_id: str) -> str:
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
     row = await db.fetchrow(
         """
         SELECT
@@ -345,9 +372,9 @@ async def _resolve_mri_subject_id(patient_id: str) -> str:
                 LIMIT 1
             ) AS latest_mri_file_path
         FROM patients p
-        WHERE p.subject_id = $1 OR p.user_id::text = $1
+        WHERE p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[])
         """,
-        patient_id,
+        lookup_tokens,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -410,6 +437,117 @@ def _get_or_build_original_nifti(subject_id: str) -> Optional[Path]:
 
 async def _resolve_subject_id(patient_id: str) -> str:
     return await _resolve_mri_subject_id(patient_id)
+
+
+async def _resolve_latest_mri_file_path(patient_id: str) -> Optional[str]:
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        return None
+
+    row = await db.fetchrow(
+        """
+        SELECT COALESCE(
+            ma.ai_analysis->>'preprocessedObjectPath',
+            ma.ai_analysis->>'preprocessed_path',
+            ma.file_path
+        ) AS "filePath"
+        FROM mri_assessments ma
+        JOIN patients p ON p.user_id = ma.patient_id
+        WHERE p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[])
+        ORDER BY ma.scan_date DESC NULLS LAST, ma.created_at DESC
+        LIMIT 1
+        """,
+        lookup_tokens,
+    )
+    if not row:
+        return None
+    file_path = dict(row).get("filePath")
+    if not file_path:
+        return None
+    return str(file_path).strip() or None
+
+
+def _try_read_nifti_bytes_from_reference(reference: Any, default_bucket: str = "mri-preprocessed") -> Optional[bytes]:
+    raw = str(reference or "").strip()
+    if not raw:
+        return None
+
+    path_candidates = [Path(raw)]
+    if raw.startswith("/app/"):
+        path_candidates.append(Path(raw.replace("/app/", "", 1)))
+
+    for path in path_candidates:
+        if path.is_file():
+            try:
+                return _read_nifti_bytes(path)
+            except Exception:
+                logger.warning("Failed to read local NIfTI file: %s", path, exc_info=True)
+
+    object_candidates: List[tuple[str, str]] = []
+    try:
+        object_candidates.append(_resolve_bucket_and_key(raw, default_bucket=default_bucket))
+    except Exception:
+        pass
+
+    if "/" not in raw and raw.endswith(".nii.gz"):
+        object_candidates.extend(
+            [
+                ("mri-preprocessed", raw),
+                ("processed", raw),
+                ("mri-scans", raw),
+            ]
+        )
+
+    seen = set()
+    deduped_candidates: List[tuple[str, str]] = []
+    for bucket, key in object_candidates:
+        token = f"{bucket}/{key}"
+        if token in seen:
+            continue
+        seen.add(token)
+        deduped_candidates.append((bucket, key))
+
+    for bucket, key in deduped_candidates:
+        response = None
+        try:
+            response = storage.client.get_object(bucket, key)
+            payload = response.read()
+        except Exception:
+            logger.debug("NIfTI object fetch failed for %s/%s", bucket, key, exc_info=True)
+            payload = None
+        finally:
+            if response is not None:
+                response.close()
+                response.release_conn()
+
+        if not payload:
+            continue
+
+        try:
+            if key.lower().endswith(".gz") or raw.lower().endswith(".gz"):
+                return gzip.decompress(payload)
+            return payload
+        except OSError:
+            return payload
+
+    return None
+
+
+async def _resolve_preprocessed_nifti_bytes(patient_id: str, subject_id: str) -> Optional[bytes]:
+    local_path = _find_preprocessed_nifti(subject_id)
+    if local_path:
+        try:
+            return _read_nifti_bytes(local_path)
+        except Exception:
+            logger.warning("Failed to read local preprocessed NIfTI: %s", local_path, exc_info=True)
+
+    latest_file_path = await _resolve_latest_mri_file_path(patient_id)
+    if latest_file_path:
+        payload = _try_read_nifti_bytes_from_reference(latest_file_path, default_bucket="mri-preprocessed")
+        if payload:
+            return payload
+
+    return None
 
 
 def _read_nifti_bytes(nii_path: Path) -> bytes:
@@ -827,7 +965,61 @@ def _to_front_patient_id(row: dict) -> str:
     return str(row.get("user_id"))
 
 
+def _normalize_risk_level(value: Any) -> Optional[str]:
+    raw = str(value or "").strip().lower()
+    if raw in {"low", "mid", "high"}:
+        return raw
+    if raw in {"medium", "moderate", "suspected", "warning"}:
+        return "mid"
+    if raw in {"confirmed", "critical"}:
+        return "high"
+    if raw in {"normal", "stable"}:
+        return "low"
+    return None
+
+
+def _derive_voice_risk_level(flag: Any, probability: Any) -> Optional[str]:
+    normalized_flag = str(flag or "").strip().lower()
+    if normalized_flag == "critical":
+        return "high"
+    if normalized_flag == "warning":
+        return "mid"
+    if normalized_flag in {"normal", "stable"}:
+        return "low"
+
+    normalized_probability = _as_float(probability)
+    if normalized_probability is None:
+        return None
+
+    # API payloads may be 0~1 or 0~100.
+    if normalized_probability > 1.0:
+        normalized_probability = normalized_probability / 100.0
+
+    normalized_probability = max(0.0, min(1.0, normalized_probability))
+    if normalized_probability >= 0.7:
+        return "high"
+    if normalized_probability >= 0.4:
+        return "mid"
+    return "low"
+
+
+def _build_voice_trend(risk_level: Optional[str]) -> Dict[str, str]:
+    if risk_level in {"mid", "high"}:
+        return {"status": "watch", "label": "변화 관찰"}
+    if risk_level == "low":
+        return {"status": "stable", "label": "안정 추세"}
+    return {"status": "unknown", "label": "정보 부족"}
+
+
 def _build_patient_summary(row: dict) -> dict:
+    db_risk_level = _normalize_risk_level(row.get("risk_level"))
+    voice_risk_level = _derive_voice_risk_level(
+        row.get("latestVoiceFlag"),
+        row.get("latestVoiceProbability"),
+    )
+    resolved_risk_level = voice_risk_level or "unknown"
+    trend = _build_voice_trend(voice_risk_level)
+
     return {
         "id": _to_front_patient_id(row),
         "rid": row.get("rid"),
@@ -839,14 +1031,20 @@ def _build_patient_summary(row: dict) -> dict:
         "lastVisit": row.get("lastVisit"),
         "examDate": row.get("examDate"),
         "latestViscode2": row.get("latestViscode2"),
-        "riskLevel": row.get("risk_level"),
+        "riskLevel": resolved_risk_level,
+        "riskLevelSource": "voice" if voice_risk_level else "unknown",
+        "trendStatus": trend["status"],
+        "trendLabel": trend["label"],
+        "latestVoiceFlag": (str(row.get("latestVoiceFlag") or "").strip().lower() or None),
+        "latestVoiceProbability": _as_float(row.get("latestVoiceProbability")),
+        "latestVoiceAssessedAt": row.get("latestVoiceAssessedAt"),
         "cdrSB": row.get("cdrSB"),
         "nxaudito": row.get("nxaudito"),
         "ldelTotal": row.get("ldelTotal"),
         "mmse": row.get("mmse"),
         "moca": row.get("moca"),
         "participationRate": row.get("participation_rate"),
-        "diagnosis": "MCI" if (row.get("risk_level") or "").lower() in {"mid", "medium", "high", "suspected", "confirmed"} else "CN",
+        "diagnosis": "MCI" if (db_risk_level or "").lower() in {"mid", "high"} else "CN",
         "hospital": row.get("hospital"),
     }
 
@@ -871,6 +1069,10 @@ async def list_patients(
 @router.get("/patients/{patient_id}")
 async def get_patient(patient_id: str):
     """Get detailed patient information including clinical trends"""
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
     # 1. Basic Info (subject_id or user_id both accepted)
     patient = await db.fetchrow(
         """
@@ -878,9 +1080,9 @@ async def get_patient(patient_id: str):
         FROM patients p
         JOIN users u ON p.user_id = u.user_id
         LEFT JOIN doctor d ON p.doctor_id = d.user_id
-        WHERE p.subject_id = $1 OR p.user_id::text = $1
+        WHERE p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[])
         """,
-        patient_id
+        lookup_tokens
     )
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")
@@ -902,7 +1104,10 @@ async def get_patient(patient_id: str):
                 lc.moca,
                 lc.cdr_sb AS "cdrSB",
                 lc.nxaudito AS "nxaudito",
-                ln.avdeltot AS "ldelTotal"
+                ln.avdeltot AS "ldelTotal",
+                lvv."latestVoiceFlag",
+                lvv."latestVoiceProbability",
+                lvv."latestVoiceAssessedAt"
             FROM patients p
             JOIN users u ON p.user_id = u.user_id
             LEFT JOIN doctor d ON p.doctor_id = d.user_id
@@ -927,6 +1132,19 @@ async def get_patient(patient_id: str):
                 ORDER BY nt.exam_date DESC NULLS LAST, nt.created_at DESC
                 LIMIT 1
             ) ln ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    va.flag AS "latestVoiceFlag",
+                    va.mci_probability AS "latestVoiceProbability",
+                    COALESCE(va.assessed_at, r.recorded_at, va.created_at, r.created_at) AS "latestVoiceAssessedAt"
+                FROM recordings r
+                JOIN voice_assessments va ON va.recording_id = r.recording_id
+                WHERE r.patient_id = p.user_id
+                  AND (r.status IS NULL OR r.status = 'completed')
+                ORDER BY COALESCE(va.assessed_at, r.recorded_at, va.created_at, r.created_at) DESC NULLS LAST,
+                         va.created_at DESC
+                LIMIT 1
+            ) lvv ON TRUE
             WHERE p.doctor_id = $1
             ORDER BY p.created_at DESC
             """,
@@ -936,10 +1154,24 @@ async def get_patient(patient_id: str):
         patient_rows = [patient]
 
     patients = [_build_patient_summary(dict(row)) for row in patient_rows]
+    resolved_front_patient_id = str(_to_front_patient_id(patient_dict))
+    requested_patient_id = str(patient_id)
     current_patient = next(
-        (p for p in patients if p["id"] == patient_id or str(p.get("rid")) == patient_id),
-        patients[0] if patients else _build_patient_summary(patient_dict),
+        (p for p in patients if str(p.get("id")) == resolved_front_patient_id),
+        None,
     )
+    if current_patient is None:
+        current_patient = next(
+            (
+                p
+                for p in patients
+                if str(p.get("id")) == requested_patient_id
+                or str(p.get("rid")) == requested_patient_id
+            ),
+            None,
+        )
+    if current_patient is None:
+        current_patient = patients[0] if patients else _build_patient_summary(patient_dict)
 
     latest_clinical_extra = await db.fetchrow(
         """
@@ -1098,38 +1330,38 @@ async def get_patient(patient_id: str):
             else _extract_subject_id_from_text(mri_dict.get("filePath")) or current_front_patient_id
         )
 
+        ai_analysis["originalImage"] = (
+            f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
+            f"?plane=axial&rv={MRI_RENDER_VERSION}"
+        )
+        ai_analysis["originalMaps"] = [
+            {
+                "plane": "axial",
+                "label": "Axial",
+                "url": (
+                    f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
+                    f"?plane=axial&rv={MRI_RENDER_VERSION}"
+                ),
+            },
+            {
+                "plane": "coronal",
+                "label": "Coronal",
+                "url": (
+                    f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
+                    f"?plane=coronal&rv={MRI_RENDER_VERSION}"
+                ),
+            },
+            {
+                "plane": "sagittal",
+                "label": "Sagittal",
+                "url": (
+                    f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
+                    f"?plane=sagittal&rv={MRI_RENDER_VERSION}"
+                ),
+            },
+        ]
         if _find_original_dicom_series_dir(mri_subject_id):
-            # 원본은 DICOM -> NIfTI 변환본을 사용해서 표시한다.
-            ai_analysis["originalImage"] = (
-                f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
-                f"?plane=axial&rv={MRI_RENDER_VERSION}"
-            )
-            ai_analysis["originalMaps"] = [
-                {
-                    "plane": "axial",
-                    "label": "Axial",
-                    "url": (
-                        f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
-                        f"?plane=axial&rv={MRI_RENDER_VERSION}"
-                    ),
-                },
-                {
-                    "plane": "coronal",
-                    "label": "Coronal",
-                    "url": (
-                        f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
-                        f"?plane=coronal&rv={MRI_RENDER_VERSION}"
-                    ),
-                },
-                {
-                    "plane": "sagittal",
-                    "label": "Sagittal",
-                    "url": (
-                        f"/api/doctor/patients/{current_front_patient_id}/mri/original-slice.png"
-                        f"?plane=sagittal&rv={MRI_RENDER_VERSION}"
-                    ),
-                },
-            ]
+            # 원본 DICOM이 있을 때는 NIfTI 원본도 함께 노출한다.
             ai_analysis["originalNifti"] = (
                 f"/api/doctor/patients/{current_front_patient_id}/mri/original-nii"
                 f"?rv={MRI_RENDER_VERSION}"
@@ -1208,19 +1440,40 @@ async def get_patient(patient_id: str):
                 ai_analysis["attentionMaps"] = attention_maps
                 ai_analysis["attentionMap"] = attention_maps[0]["url"]
 
-        if not attention_slides and "attentionMaps" not in ai_analysis and _find_preprocessed_nifti(mri_subject_id):
-            # CAM이 없을 때 fallback: 전처리본 중간 슬라이스를 노출한다.
-            fallback_attention = (
+        fallback_preprocessed_exists = bool(
+            _find_preprocessed_nifti(mri_subject_id) or str(mri_dict.get("filePath") or "").strip()
+        )
+        if not attention_slides and "attentionMaps" not in ai_analysis and fallback_preprocessed_exists:
+            # CAM이 없을 때 fallback: 전처리본 3면 슬라이스를 노출한다.
+            ai_analysis["attentionMap"] = (
                 f"/api/doctor/patients/{current_front_patient_id}/mri/preprocessed-slice.png"
-                f"?rv={MRI_RENDER_VERSION}"
+                f"?plane=axial&rv={MRI_RENDER_VERSION}"
             )
-            ai_analysis["attentionMap"] = fallback_attention
             ai_analysis["attentionMaps"] = [
                 {
                     "plane": "axial",
                     "label": "Axial",
-                    "url": fallback_attention,
-                }
+                    "url": (
+                        f"/api/doctor/patients/{current_front_patient_id}/mri/preprocessed-slice.png"
+                        f"?plane=axial&rv={MRI_RENDER_VERSION}"
+                    ),
+                },
+                {
+                    "plane": "coronal",
+                    "label": "Coronal",
+                    "url": (
+                        f"/api/doctor/patients/{current_front_patient_id}/mri/preprocessed-slice.png"
+                        f"?plane=coronal&rv={MRI_RENDER_VERSION}"
+                    ),
+                },
+                {
+                    "plane": "sagittal",
+                    "label": "Sagittal",
+                    "url": (
+                        f"/api/doctor/patients/{current_front_patient_id}/mri/preprocessed-slice.png"
+                        f"?plane=sagittal&rv={MRI_RENDER_VERSION}"
+                    ),
+                },
             ]
 
         mri_analysis = {
@@ -1413,21 +1666,25 @@ async def get_attention_map_png(
     slide: int = Query(1, ge=1, le=50, description="ROI slide index (1-based)"),
 ):
     """Return latest CAM attention map image from ai_analysis, with preprocessed-slice fallback."""
+    requested_plane = _normalize_plane_name(plane)
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
     row = await db.fetchrow(
         """
         SELECT ma.ai_analysis AS "aiAnalysis"
         FROM mri_assessments ma
         JOIN patients p ON p.user_id = ma.patient_id
-        WHERE p.subject_id = $1 OR p.user_id::text = $1
+        WHERE p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[])
         ORDER BY ma.scan_date DESC NULLS LAST, ma.created_at DESC
         LIMIT 1
         """,
-        patient_id,
+        lookup_tokens,
     )
 
     ai_analysis = _as_dict(dict(row).get("aiAnalysis")) if row else {}
     if ai_analysis:
-        requested_plane = _normalize_plane_name(plane)
         resolved = _resolve_attention_map_object(ai_analysis, plane=requested_plane, slide_index=slide)
         if not resolved and requested_plane != "axial":
             resolved = _resolve_attention_map_object(ai_analysis, plane="axial", slide_index=slide)
@@ -1452,7 +1709,7 @@ async def get_attention_map_png(
                     response.release_conn()
 
     # Fallback for rows without CAM artifacts.
-    return await get_preprocessed_nifti_slice_png(patient_id)
+    return await get_preprocessed_nifti_slice_png(patient_id, plane=requested_plane)
 
 
 @router.get("/patients/{patient_id}/mri/original-slice.png")
@@ -1463,23 +1720,32 @@ async def get_original_nifti_slice_png(
     """Render representative original MRI slice for the requested plane and return PNG bytes."""
     subject_id = await _resolve_subject_id(patient_id)
     nii_path = _get_or_build_original_nifti(subject_id)
-    if not nii_path:
-        raise HTTPException(status_code=404, detail=f"Original MRI (DICOM) not found for subject_id={subject_id}")
 
     try:
         target_plane = _normalize_plane_name(plane)
-        raw_original_nifti = _read_nifti_bytes(nii_path)
-        preprocessed_path = _find_preprocessed_nifti(subject_id)
-        if preprocessed_path and target_plane == "axial":
-            raw_preprocessed_nifti = _read_nifti_bytes(preprocessed_path)
-            image_2d = _find_aligned_original_slice_uint8(
-                raw_original_nifti,
-                raw_preprocessed_nifti,
+        raw_original_nifti = _read_nifti_bytes(nii_path) if nii_path else None
+        if raw_original_nifti is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Original MRI source not found for subject_id={subject_id}",
             )
+
+        if nii_path and target_plane == "axial":
+            raw_preprocessed_nifti = await _resolve_preprocessed_nifti_bytes(patient_id, subject_id)
+            if raw_preprocessed_nifti is not None:
+                image_2d = _find_aligned_original_slice_uint8(
+                    raw_original_nifti,
+                    raw_preprocessed_nifti,
+                )
+            else:
+                image_2d = _extract_representative_axial_slice_uint8(raw_original_nifti)
         elif target_plane == "axial":
-            image_2d = _extract_representative_axial_slice_uint8(raw_original_nifti)
+            image_2d = _extract_plane_slice_uint8(raw_original_nifti, "axial")
         else:
             image_2d = _extract_plane_slice_uint8(raw_original_nifti, target_plane)
+            if target_plane in ("coronal", "sagittal"):
+                # Keep original MRI orientation consistent with previous UI expectation.
+                image_2d = image_2d[::-1, ::-1].copy()
         png_bytes = _encode_png_gray8(image_2d)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Failed to render NIfTI slice: {exc}") from exc
@@ -1492,16 +1758,19 @@ async def get_original_nifti_slice_png(
 
 
 @router.get("/patients/{patient_id}/mri/preprocessed-slice.png")
-async def get_preprocessed_nifti_slice_png(patient_id: str):
-    """Render a middle axial slice from preprocessed NIfTI and return PNG bytes."""
+async def get_preprocessed_nifti_slice_png(
+    patient_id: str,
+    plane: str = Query("axial", description="axial | coronal | sagittal"),
+):
+    """Render representative slice from preprocessed NIfTI and return PNG bytes."""
     subject_id = await _resolve_subject_id(patient_id)
-    nii_path = _find_preprocessed_nifti(subject_id)
-    if not nii_path:
+    raw_nifti = await _resolve_preprocessed_nifti_bytes(patient_id, subject_id)
+    if raw_nifti is None:
         raise HTTPException(status_code=404, detail=f"Preprocessed NIfTI not found for subject_id={subject_id}")
 
     try:
-        raw_nifti = _read_nifti_bytes(nii_path)
-        image_2d = _extract_middle_slice_uint8(raw_nifti)
+        target_plane = _normalize_plane_name(plane)
+        image_2d = _extract_plane_slice_uint8(raw_nifti, target_plane)
         # 1) 원본 방향과 맞추기 위해 180도 회전
         # 2) 사이드 빈공간 색칠은 비활성화 (원본 보존)
         import numpy as np
@@ -1575,13 +1844,17 @@ async def submit_mri_doctor_diagnosis(
         if not normalized_stage:
             raise HTTPException(status_code=400, detail="Invalid MRI stage. Use CN/sMCI/pMCI/AD.")
 
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
     patient = await db.fetchrow(
         """
         SELECT user_id
         FROM patients
-        WHERE subject_id = $1 OR user_id::text = $1
+        WHERE subject_id = ANY($1::text[]) OR user_id::text = ANY($1::text[])
         """,
-        patient_id,
+        lookup_tokens,
     )
     if not patient:
         raise HTTPException(status_code=404, detail="Patient not found")

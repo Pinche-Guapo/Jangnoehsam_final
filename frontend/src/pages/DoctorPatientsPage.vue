@@ -79,9 +79,34 @@ const riskLabelMap = {
   high: 'HIGH'
 }; // 위험도 라벨을 통일한다
 
-const formatRiskLabel = (riskLevel) => riskLabelMap[riskLevel] || 'UNKNOWN'; // 위험도 라벨을 출력한다
+const normalizeRiskLevel = (riskLevel) => {
+  const normalized = String(riskLevel || '').trim().toLowerCase();
+  if (normalized === 'medium') return 'mid';
+  if (normalized === 'low' || normalized === 'mid' || normalized === 'high') return normalized;
+  return 'unknown';
+}; // 위험도 값을 표준화한다
 
-const hasRecentChange = (riskLevel) => riskLevel === 'mid' || riskLevel === 'high'; // 변화 관찰이 필요한지 표시한다
+const formatRiskLabel = (riskLevel) => riskLabelMap[normalizeRiskLevel(riskLevel)] || 'UNKNOWN'; // 위험도 라벨을 출력한다
+
+const getTrendStatus = (patient) => {
+  const backendStatus = String(patient?.trendStatus || '').trim().toLowerCase();
+  if (backendStatus === 'watch' || backendStatus === 'stable' || backendStatus === 'unknown') {
+    return backendStatus;
+  }
+  const normalizedRisk = normalizeRiskLevel(patient?.riskLevel);
+  if (normalizedRisk === 'mid' || normalizedRisk === 'high') return 'watch';
+  if (normalizedRisk === 'low') return 'stable';
+  return 'unknown';
+}; // 추세 상태를 음성기반 결과 우선으로 계산한다
+
+const getTrendLabel = (patient) => {
+  const backendLabel = String(patient?.trendLabel || '').trim();
+  if (backendLabel) return backendLabel;
+  const status = getTrendStatus(patient);
+  if (status === 'watch') return '변화 관찰';
+  if (status === 'stable') return '안정 추세';
+  return '정보 부족';
+}; // 추세 라벨을 계산한다
 
 const handleSelectPatient = (patientId) => {
   if (!patientId) return; // 잘못된 입력을 방지한다
@@ -154,13 +179,13 @@ const handleSelectPatient = (patientId) => {
               <span>{{ patient.hospital || '-' }}</span>
             </div>
             <div class="patient-flags">
-              <span :class="['flag', hasRecentChange(patient.riskLevel) ? 'flag-change' : 'flag-stable']">
-                {{ hasRecentChange(patient.riskLevel) ? '변화 관찰' : '안정 추세' }}
+              <span :class="['flag', `flag-${getTrendStatus(patient)}`]">
+                {{ getTrendLabel(patient) }}
               </span>
             </div>
           </div>
           <div class="patient-right">
-            <span :class="['risk-pill', `risk-${patient.riskLevel || 'unknown'}`]">
+            <span :class="['risk-pill', `risk-${normalizeRiskLevel(patient.riskLevel)}`]">
               {{ formatRiskLabel(patient.riskLevel) }}
             </span>
           </div>
@@ -332,7 +357,7 @@ const handleSelectPatient = (patientId) => {
   font-weight: 800;
 }
 
-.flag-change {
+.flag-watch {
   background: rgba(255, 183, 77, 0.2);
   color: #f5a623;
 }
@@ -340,6 +365,11 @@ const handleSelectPatient = (patientId) => {
 .flag-stable {
   background: rgba(76, 183, 183, 0.15);
   color: #4cb7b7;
+}
+
+.flag-unknown {
+  background: #eef1f3;
+  color: #888;
 }
 
 .patient-right {

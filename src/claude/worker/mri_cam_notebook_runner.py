@@ -191,6 +191,87 @@ def _choose_stage(runtime: Dict[str, Any], final_label: str) -> Tuple[Any, int, 
     return runtime["ci_model"], 0, "Stage2_MCI-vs-AD", "MCI"
 
 
+def _safe_mid_index(volume_np: np.ndarray, mask_for_profile: np.ndarray, dim: int) -> int:
+    foreground_coords = np.argwhere(mask_for_profile > 0.0)
+    if foreground_coords.size:
+        min_idx = int(foreground_coords[:, dim].min())
+        max_idx = int(foreground_coords[:, dim].max())
+        return int(round((min_idx + max_idx) / 2.0))
+    if dim == 0:
+        return int(volume_np.shape[0] // 2)
+    if dim == 1:
+        return int(volume_np.shape[1] // 2)
+    return int(volume_np.shape[2] // 2)
+
+
+def _cam_peak_index(cam_np: np.ndarray, mask_for_profile: np.ndarray, dim: int) -> int | None:
+    positive = np.maximum(cam_np, 0.0) * mask_for_profile
+    valid_positive = positive[positive > 0.0]
+    if valid_positive.size == 0:
+        return None
+
+    high_thr = float(np.percentile(valid_positive, 85))
+    high_mask = positive >= high_thr
+
+    if dim == 0:
+        high_profile = high_mask.sum(axis=(1, 2)).astype(np.float32)
+        cam_profile = positive.sum(axis=(1, 2)).astype(np.float32)
+        fg_profile = mask_for_profile.sum(axis=(1, 2)).astype(np.float32)
+    elif dim == 1:
+        high_profile = high_mask.sum(axis=(0, 2)).astype(np.float32)
+        cam_profile = positive.sum(axis=(0, 2)).astype(np.float32)
+        fg_profile = mask_for_profile.sum(axis=(0, 2)).astype(np.float32)
+    else:
+        high_profile = high_mask.sum(axis=(0, 1)).astype(np.float32)
+        cam_profile = positive.sum(axis=(0, 1)).astype(np.float32)
+        fg_profile = mask_for_profile.sum(axis=(0, 1)).astype(np.float32)
+
+    max_fg = float(np.max(fg_profile)) if fg_profile.size else 0.0
+    min_fg = max(16.0, max_fg * 0.05)
+    valid = fg_profile >= min_fg
+    if not np.any(valid):
+        valid = fg_profile > 0.0
+    if not np.any(valid):
+        return None
+
+    high_profile = np.where(valid, high_profile, -np.inf)
+    if np.isfinite(high_profile).any() and float(np.nanmax(high_profile)) > 0.0:
+        return int(np.nanargmax(high_profile))
+
+    cam_profile = np.where(valid, cam_profile, -np.inf)
+    if np.isfinite(cam_profile).any() and float(np.nanmax(cam_profile)) > 0.0:
+        return int(np.nanargmax(cam_profile))
+    return None
+
+
+def _resolve_slice_mode(plane: str) -> str:
+    global_mode = str(os.getenv("MRI_CAM_SLICE_MODE", "cam_peak")).strip().lower()
+    per_plane_mode = str(os.getenv(f"MRI_CAM_{plane.upper()}_SLICE_MODE", "")).strip().lower()
+    if per_plane_mode:
+        return per_plane_mode
+    if plane == "axial":
+        # Keep axial closer to original MRI view by default.
+        axial_mode = str(os.getenv("MRI_CAM_AXIAL_SLICE_MODE", "safe_mid")).strip().lower()
+        return axial_mode or global_mode
+    return global_mode
+
+
+def _apply_plane_shift(plane: str, index: int, shape: Tuple[int, int, int]) -> int:
+    dim = PLANE_META[plane][0]
+    depth = int(shape[dim])
+    if depth <= 0:
+        return index
+
+    total_shift = 0
+    if plane == "axial":
+        total_shift += int(os.getenv("MRI_AXIAL_SLICE_SHIFT", "0"))
+    total_shift += int(os.getenv(f"MRI_CAM_{plane.upper()}_EXTRA_SHIFT", "0"))
+
+    if total_shift == 0:
+        return int(np.clip(index, 0, depth - 1))
+    return int(np.clip(index + total_shift, 0, depth - 1))
+
+
 def _save_roi_plane_overlay(
     runtime: Dict[str, Any],
     volume_np: np.ndarray,
@@ -202,8 +283,6 @@ def _save_roi_plane_overlay(
 ) -> int:
     dim, _ = PLANE_META[plane]
     # Use a robust foreground profile for slice selection.
-    # Some preprocessed files have near-flat masks, where argmax would pick
-    # index 0 and produce visually clipped anatomy.
     mask_for_profile = np.asarray(brain_mask > 0.0, dtype=np.float32)
     coverage = float(mask_for_profile.mean()) if mask_for_profile.size else 0.0
     if coverage < 0.02 or coverage > 0.98:
@@ -219,23 +298,20 @@ def _save_roi_plane_overlay(
                 dtype=np.float32,
             )
 
-    foreground_coords = np.argwhere(mask_for_profile > 0.0)
-    if foreground_coords.size:
-        min_idx = int(foreground_coords[:, dim].min())
-        max_idx = int(foreground_coords[:, dim].max())
-        safe_index = int(round((min_idx + max_idx) / 2.0))
+    # Slice mode:
+    # - cam_peak: chooses the slice with strongest/highest CAM occupancy.
+    # - safe_mid: midpoint of foreground bounds.
+    # Axial defaults to safe_mid for better visual alignment with original MRI.
+    slice_mode = _resolve_slice_mode(plane)
+    safe_mid_index = _safe_mid_index(volume_np, mask_for_profile, dim)
+    if slice_mode == "safe_mid":
+        safe_index = safe_mid_index
     else:
-        if dim == 0:
-            safe_index = int(volume_np.shape[0] // 2)
-        elif dim == 1:
-            safe_index = int(volume_np.shape[1] // 2)
-        else:
-            safe_index = int(volume_np.shape[2] // 2)
+        safe_index = _cam_peak_index(cam_np, mask_for_profile, dim)
+        if safe_index is None:
+            safe_index = safe_mid_index
 
-    if plane == "axial":
-        axial_shift = int(os.getenv("MRI_AXIAL_SLICE_SHIFT", "0"))
-        if axial_shift != 0:
-            safe_index = int(np.clip(safe_index + axial_shift, 0, volume_np.shape[0] - 1))
+    safe_index = _apply_plane_shift(plane, safe_index, volume_np.shape)
 
     # Keep full anatomical shape on base image (no base masking).
     if dim == 0:
