@@ -203,12 +203,37 @@ const formatRatioScaleValue = (value: number) => {
   return value.toFixed(3).replace(/\.?0+$/, '');
 };
 
-const normalizeSeries = (values: number[]) => {
+const VOICE_METRIC_DEFAULT_RANGE: Record<string, { min: number; max: number }> = {
+  utterance: { min: 0, max: 12 },
+  length: { min: 0, max: 8 },
+  pause: { min: 0, max: 1 },
+  participation: { min: 0, max: 6 }
+};
+
+const smoothSeries = (values: number[]) => {
+  if (!values.length) return [];
+  if (values.length < 3) return [...values];
+  return values.map((value, index) => {
+    const prev = values[index - 1] ?? value;
+    const next = values[index + 1] ?? value;
+    return (prev + value + next) / 3;
+  });
+};
+
+const normalizeVoiceSeries = (metricId: string, values: number[]) => {
   if (!values || values.length < 2) return [];
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  if (max === min) return values.map(() => 0.5);
-  return values.map((value) => (value - min) / (max - min));
+  const smoothed = smoothSeries(values);
+  const defaultRange = VOICE_METRIC_DEFAULT_RANGE[metricId] ?? { min: 0, max: 1 };
+  const observedMax = Math.max(...smoothed);
+  const rangeMin = defaultRange.min;
+  const rangeMax = Math.max(defaultRange.max, observedMax * 1.1);
+  const span = Math.max(rangeMax - rangeMin, 1e-6);
+
+  return smoothed.map((value) => {
+    const normalized = clamp((value - rangeMin) / span, 0, 1);
+    // Prevent tiny numeric fluctuations from looking overly sharp on small screens.
+    return 0.5 + (normalized - 0.5) * 0.7;
+  });
 };
 
 const getNormalizedPath = (values: number[], width = VOICE_CHART_WIDTH, height = VOICE_CHART_HEIGHT) => {
@@ -223,9 +248,9 @@ const getNormalizedPath = (values: number[], width = VOICE_CHART_WIDTH, height =
   return `M ${points.join(' L ')}`;
 };
 
-const getTrendDirection = (values: number[]) => {
+const getTrendDirection = (metricId: string, values: number[]) => {
   if (!values || values.length < 2) return 'stable';
-  const normalized = normalizeSeries(values);
+  const normalized = normalizeVoiceSeries(metricId, values);
   if (normalized.length < 2) return 'stable';
   const diff = normalized.at(-1)! - normalized.at(-2)!;
   if (Math.abs(diff) < 0.05) return 'stable';
@@ -1459,7 +1484,7 @@ const voiceMetrics = computed(() => {
 const normalizedVoiceMetrics = computed(() =>
   voiceMetrics.value.map((metric) => ({
     ...metric,
-    normalized: normalizeSeries(metric.values)
+    normalized: normalizeVoiceSeries(metric.id, metric.values)
   }))
 );
 
@@ -1498,7 +1523,7 @@ const voiceSummary = computed(() => {
     };
   }
 
-  const directions = activeVoiceMetrics.value.map((metric) => getTrendDirection(metric.values));
+  const directions = activeVoiceMetrics.value.map((metric) => getTrendDirection(metric.id, metric.values));
   const hasIncrease = directions.includes('increase');
   const hasDecrease = directions.includes('decrease');
 

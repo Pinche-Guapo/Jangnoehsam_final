@@ -45,6 +45,7 @@ const SESSION_LIMIT_MS = 300_000;
 const SESSION_LIMIT_SEC = 300;
 const WARMUP_END_SEC = 45;
 const SOFT_WRAP_START_SEC = 240;
+const HARD_WRAP_BUFFER_SEC = 20;
 const LISTEN_RETRY_DELAY_MS = 350;
 const PROFILE_ID_STORAGE_KEY = "voice_profile_id";
 const SPEECH_SILENCE_COMMIT_MS = 1300;
@@ -63,6 +64,8 @@ const DEFAULT_CONVERSATION_MODE = "mixed";
 const SESSION_AUDIO_TIMESLICE_MS = 1000;
 const EMERGENCY_RESPONSE_FALLBACK =
   "지금 연결이 잠시 불안정해요. 잠깐 후 다시 시도해 주세요.";
+const TIMEOUT_CLOSING_FALLBACK =
+  "시간이 거의 다 되어 오늘 대화는 여기서 마무리할게요. 다음에 이어서 이야기해요.";
 
 const DEFAULT_MODEL_RESULT: Record<string, unknown> = {
   stage: "경도 인지저하 의심 단계",
@@ -108,6 +111,7 @@ let speakingLevelPhase = 0;
 let noSpeechRetryCount = 0;
 let sttNoSpeechRetryCount = 0;
 let incompleteCommitRetryCount = 0;
+let timeoutCloseInProgress = false;
 let sessionRecorder: MediaRecorder | null = null;
 let sessionRecorderStream: MediaStream | null = null;
 let sessionAudioChunks: Blob[] = [];
@@ -644,12 +648,12 @@ const inferPhaseByTime = (elapsedSec: number): ConversationPhase => {
 };
 
 const shouldRequestClose = (elapsedSec: number) => {
-  if (elapsedSec >= SESSION_LIMIT_SEC - 8) return true;
+  if (elapsedSec >= SESSION_LIMIT_SEC - HARD_WRAP_BUFFER_SEC) return true;
   return elapsedSec >= SOFT_WRAP_START_SEC;
 };
 
 const inferClosingReason = (elapsedSec: number) => {
-  if (elapsedSec >= SESSION_LIMIT_SEC - 8) return "timeout_hard";
+  if (elapsedSec >= SESSION_LIMIT_SEC - HARD_WRAP_BUFFER_SEC) return "timeout_hard";
   if (elapsedSec >= SOFT_WRAP_START_SEC) return "timeout_soft";
   return undefined;
 };
@@ -707,10 +711,51 @@ const buildMetaPayload = (
   };
 };
 
+const requestGracefulTimeoutClose = async (token: number) => {
+  if (!isCurrentSession(token)) return;
+  if (timeoutCloseInProgress) return;
+  timeoutCloseInProgress = true;
+
+  stopRecognition();
+  state.value = "processing";
+
+  try {
+    const response = await sendChat(
+      "",
+      DEFAULT_MODEL_RESULT,
+      dialogState.value,
+      buildMetaPayload("timeout_close", true, {
+        stt_event: "no_speech",
+        closing_reason: "timeout_hard",
+      })
+    );
+
+    if (!isCurrentSession(token)) return;
+
+    if (response.session_id) {
+      sessionId.value = response.session_id;
+    }
+    dialogState.value = response.state ?? dialogState.value;
+    const backendPhase = normalizeConversationPhase(response.meta?.conversation_phase);
+    if (backendPhase) {
+      conversationPhase.value = backendPhase;
+    }
+
+    const reply = response.response?.trim() || TIMEOUT_CLOSING_FALLBACK;
+    const spoke = await botSpeak(reply, token);
+    if (!spoke) return;
+  } catch (error) {
+    console.error("Graceful timeout close failed", error);
+  }
+
+  if (!isCurrentSession(token)) return;
+  await stopSession("target_reached");
+};
+
 const stopIfTimedOut = async (token: number) => {
   if (!isCurrentSession(token)) return true;
   if (!hasTimedOut()) return false;
-  await stopSession("target_reached");
+  await requestGracefulTimeoutClose(token);
   return true;
 };
 
@@ -859,7 +904,7 @@ const extractTranscriptFromResults = (results: SpeechRecognitionResultList) => {
 const startLiveRecognition = (token: number) => {
   if (!isCurrentSession(token)) return;
   if (hasTimedOut()) {
-    void stopSession("target_reached");
+    void requestGracefulTimeoutClose(token);
     return;
   }
 
@@ -969,7 +1014,7 @@ const startLiveRecognition = (token: number) => {
     }
 
     if (hasTimedOut()) {
-      void stopSession("target_reached");
+      void requestGracefulTimeoutClose(token);
       return;
     }
 
@@ -990,7 +1035,7 @@ const startLiveRecognition = (token: number) => {
 
     if (!isCurrentSession(token)) return;
     if (hasTimedOut()) {
-      void stopSession("target_reached");
+      void requestGracefulTimeoutClose(token);
       return;
     }
     if (state.value === "processing" || state.value === "speaking" || state.value === "cooldown") return;
@@ -1095,7 +1140,7 @@ const startSessionTimer = (token: number) => {
   clearSessionTimer();
   sessionTimer = window.setTimeout(() => {
     if (!isCurrentSession(token)) return;
-    void stopSession("target_reached");
+    void requestGracefulTimeoutClose(token);
   }, SESSION_LIMIT_MS);
 };
 
@@ -1118,6 +1163,7 @@ const startSession = async () => {
   noSpeechRetryCount = 0;
   sttNoSpeechRetryCount = 0;
   incompleteCommitRetryCount = 0;
+  timeoutCloseInProgress = false;
 
   startSessionTimer(token);
   scheduleSoftWrapCue(token);
@@ -1170,6 +1216,7 @@ const stopSession = async (reason: SessionEndReason, clearMessages = false) => {
   noSpeechRetryCount = 0;
   sttNoSpeechRetryCount = 0;
   incompleteCommitRetryCount = 0;
+  timeoutCloseInProgress = false;
 
   if (clearMessages) {
     messages.value = [];
@@ -1223,6 +1270,7 @@ const resetSession = () => {
     noSpeechRetryCount = 0;
     sttNoSpeechRetryCount = 0;
     incompleteCommitRetryCount = 0;
+    timeoutCloseInProgress = false;
     messages.value = [];
     return;
   }
@@ -1244,7 +1292,7 @@ export function useVoiceSession() {
 
     if (state.value !== "idle") return;
     if (hasTimedOut()) {
-      void stopSession("target_reached");
+      void requestGracefulTimeoutClose(sessionToken);
       return;
     }
 
