@@ -19,10 +19,12 @@ interface VisitRecord {
   examDate: string;
   viscode2?: string | null;
   imageId?: string | null;
+  mriAssessmentId?: string | null;
 }
 
-interface VisitRecordWithImage extends VisitRecord {
-  imageId: string;
+interface VisitOption extends VisitRecord {
+  optionKey: string;
+  optionValue: string;
 }
 
 interface BiomarkerResults {
@@ -514,6 +516,32 @@ const currentPatient = computed(() => props.data?.currentPatient || null);
 const visits = computed<VisitRecord[]>(
   () => (props.data?.visits as VisitRecord[] | undefined) ?? []
 );
+const sortedVisits = computed(() => {
+  if (!visits.value.length) return [];
+  return [...visits.value].sort((a, b) => new Date(a.examDate).getTime() - new Date(b.examDate).getTime());
+});
+
+const visitOptions = computed<VisitOption[]>(() =>
+  sortedVisits.value.map((visit, index) => {
+    const imageId = String(visit?.imageId ?? '').trim();
+    const fallbackBase = String(visit?.examDate || visit?.viscode2 || `visit-${index}`).trim();
+    const fallbackValue = `${fallbackBase}-${index}`;
+
+    return {
+      ...visit,
+      optionKey: imageId || fallbackValue,
+      optionValue: imageId || fallbackValue
+    };
+  })
+);
+
+const selectedVisitImageId = ref('');
+const selectedVisitOption = computed<VisitOption | null>(() => {
+  if (!visitOptions.value.length) return null;
+  const selected = visitOptions.value.find((visit) => visit.optionValue === selectedVisitImageId.value);
+  return selected ?? visitOptions.value.at(-1) ?? null;
+});
+
 const clinicalTrends = computed<ClinicalTrends | null>(() =>
   props.data?.clinicalTrends ?? null
 );
@@ -564,6 +592,60 @@ const voiceChartDailyParticipation = computed(() => {
 const mriAnalysis = computed(() => props.data?.mriAnalysis || null);
 
 const aiAnalysis = computed(() => mriAnalysis.value?.aiAnalysis || null);
+const selectedVisitImageIdParam = computed(() => {
+  const raw = String(selectedVisitOption.value?.imageId ?? '').trim();
+  if (!raw) return '';
+  return /^\d+$/.test(raw) ? raw : '';
+});
+
+const selectedVisitAssessmentIdParam = computed(() => {
+  const raw = String(selectedVisitOption.value?.mriAssessmentId ?? '').trim();
+  if (!raw) return '';
+  return raw;
+});
+
+const selectedVisitExamDateParam = computed(() => {
+  const raw = String(selectedVisitOption.value?.examDate ?? '').trim();
+  if (!raw) return '';
+  const match = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  return match ? match[1] : '';
+});
+
+const selectedVisitViscode2Param = computed(() => {
+  const raw = String(selectedVisitOption.value?.viscode2 ?? '').trim();
+  return raw;
+});
+
+const upsertQueryParam = (url: string, key: string, value: string) => {
+  const raw = String(url || '').trim();
+  if (!raw || !key || !value) return raw;
+  const encodedValue = encodeURIComponent(value);
+  const matcher = new RegExp(`([?&]${key}=)[^&]*`, 'i');
+  if (matcher.test(raw)) {
+    return raw.replace(matcher, `$1${encodedValue}`);
+  }
+  return `${raw}${raw.includes('?') ? '&' : '?'}${key}=${encodedValue}`;
+};
+
+const appendSelectedVisitContext = (url: string) => {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  let next = raw;
+  if (selectedVisitImageIdParam.value) {
+    next = upsertQueryParam(next, 'image_id', selectedVisitImageIdParam.value);
+  }
+  if (selectedVisitAssessmentIdParam.value) {
+    next = upsertQueryParam(next, 'mri_assessment_id', selectedVisitAssessmentIdParam.value);
+  }
+  if (selectedVisitExamDateParam.value) {
+    next = upsertQueryParam(next, 'visit_exam_date', selectedVisitExamDateParam.value);
+  }
+  if (selectedVisitViscode2Param.value) {
+    next = upsertQueryParam(next, 'visit_viscode2', selectedVisitViscode2Param.value);
+  }
+  return next;
+};
+
 const buildMriSliceEndpoint = (
   sliceType: 'original-slice' | 'preprocessed-slice',
   plane?: AttentionMapItem['plane']
@@ -595,9 +677,7 @@ const originalImage = computed(() => {
   const provided = String(aiAnalysis.value?.originalImage || '').trim();
   const endpoint = buildMriSliceEndpoint('original-slice', 'axial');
 
-  if (provided.includes('/api/doctor/patients/')) {
-    return provided;
-  }
+  if (provided.includes('/api/doctor/patients/')) return provided;
 
   return endpoint || provided;
 });
@@ -606,9 +686,7 @@ const attentionMap = computed(() => {
   const provided = String(aiAnalysis.value?.attentionMap || '').trim();
   const endpoint = buildMriSliceEndpoint('preprocessed-slice');
 
-  if (provided.includes('/api/doctor/patients/')) {
-    return provided;
-  }
+  if (provided.includes('/api/doctor/patients/')) return provided;
 
   return endpoint || provided;
 });
@@ -626,10 +704,8 @@ const isNotebookAttentionLayout = computed(() => {
 });
 
 const resolveAttentionStoragePlane = (plane: AttentionMapItem['plane']): AttentionMapItem['plane'] => {
-  if (!isNotebookAttentionLayout.value) return plane;
-  if (plane === 'axial') return 'sagittal';
-  if (plane === 'sagittal') return 'axial';
-  return 'coronal';
+  // Backend now returns canonical plane mapping, so keep frontend mapping identity.
+  return plane;
 };
 
 const rewriteAttentionPlaneQuery = (url: string, requestedPlane: AttentionMapItem['plane']) => {
@@ -885,17 +961,6 @@ const dataAvailability = computed<DataAvailability>(() => {
   };
 });
 
-const sortedVisits = computed(() => {
-  if (!visits.value.length) return [];
-  return [...visits.value].sort((a, b) => new Date(a.examDate).getTime() - new Date(b.examDate).getTime());
-});
-
-const visitOptions = computed<VisitRecordWithImage[]>(() =>
-  sortedVisits.value.filter(
-    (visit): visit is VisitRecordWithImage => Boolean(visit?.imageId)
-  )
-);
-const selectedVisitImageId = ref('');
 const mriViewSyncEnabled = ref(true);
 const mriViewSyncIcon = computed(() => (mriViewSyncEnabled.value ? '🔗' : '⛓️‍💥'));
 const mriViewSyncButtonLabel = computed(() =>
@@ -1629,8 +1694,17 @@ const handleDiagnosisSubmit = (data: any) => {
 watch(
   () => visitOptions.value,
   (value) => {
-    if (!value?.length) return;
-    selectedVisitImageId.value = value.at(-1)?.imageId || '';
+    if (!value?.length) {
+      selectedVisitImageId.value = '';
+      return;
+    }
+    if (
+      selectedVisitImageId.value &&
+      value.some((visit) => visit.optionValue === selectedVisitImageId.value)
+    ) {
+      return;
+    }
+    selectedVisitImageId.value = value.at(-1)?.optionValue || '';
   },
   { immediate: true }
 );
@@ -2079,8 +2153,8 @@ watch(
                 <div v-if="visitOptions.length > 0" class="visit-selector-row">
                   <label for="visit-selector">방문 기록</label>
                   <select id="visit-selector" v-model="selectedVisitImageId">
-                    <option v-for="visit in visitOptions" :key="visit.imageId || visit.examDate" :value="visit.imageId || ''">
-                      {{ String(visit.viscode2 || '').toUpperCase() }} · {{ visit.examDate }}
+                    <option v-for="visit in visitOptions" :key="visit.optionKey" :value="visit.optionValue">
+                      {{ String(visit.viscode2 || 'VISIT').toUpperCase() }} · {{ visit.examDate }}
                     </option>
                   </select>
                 </div>

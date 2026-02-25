@@ -467,6 +467,236 @@ async def _resolve_latest_mri_file_path(patient_id: str) -> Optional[str]:
     return str(file_path).strip() or None
 
 
+async def _resolve_mri_assessment_for_image_id(
+    patient_id: str,
+    image_id: Optional[str],
+    mri_assessment_id: Optional[str] = None,
+    visit_exam_date: Optional[str] = None,
+    visit_viscode2: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Resolve MRI assessment payload for a selected visit context.
+
+    Priority:
+    0) direct mri_assessment_id
+    1) visits.image_id -> visits.mri_assessment_id
+    2) direct mri_assessments.image_id match
+    3) selected visit (exam_date/viscode2) -> visits.mri_assessment_id
+    4) nearest mri_assessments row by selected visit date
+    5) latest mri_assessments row fallback
+    """
+    raw_image_id = str(image_id or "").strip()
+    raw_assessment_id = str(mri_assessment_id or "").strip()
+    raw_visit_exam_date = str(visit_exam_date or "").strip()
+    raw_visit_viscode2 = str(visit_viscode2 or "").strip().lower()
+    lookup_tokens = _patient_lookup_tokens(patient_id)
+    if not lookup_tokens:
+        return None
+
+    if raw_assessment_id:
+        try:
+            parsed_assessment_id = UUID(raw_assessment_id)
+        except ValueError:
+            parsed_assessment_id = None
+
+        if parsed_assessment_id is not None:
+            direct_assessment_row = await db.fetchrow(
+                """
+                SELECT
+                    ma.assessment_id AS "assessmentId",
+                    ma.ai_analysis AS "aiAnalysis",
+                    COALESCE(
+                        ma.ai_analysis->>'preprocessedObjectPath',
+                        ma.ai_analysis->>'preprocessed_path',
+                        ma.file_path
+                    ) AS "filePath",
+                    ma.scan_date AS "scanDate",
+                    ma.created_at AS "createdAt",
+                    ma.image_id AS "imageId"
+                FROM mri_assessments ma
+                JOIN patients p ON p.user_id = ma.patient_id
+                WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+                  AND ma.assessment_id = $2
+                LIMIT 1
+                """,
+                lookup_tokens,
+                parsed_assessment_id,
+            )
+            if direct_assessment_row:
+                return dict(direct_assessment_row)
+
+    parsed_image_id: Optional[int] = None
+    if raw_image_id:
+        try:
+            parsed_image_id = int(raw_image_id)
+        except ValueError:
+            parsed_image_id = None
+
+    if parsed_image_id is not None:
+        visit_row = await db.fetchrow(
+            """
+            SELECT
+                ma.assessment_id AS "assessmentId",
+                ma.ai_analysis AS "aiAnalysis",
+                COALESCE(
+                    ma.ai_analysis->>'preprocessedObjectPath',
+                    ma.ai_analysis->>'preprocessed_path',
+                    ma.file_path
+                ) AS "filePath",
+                ma.scan_date AS "scanDate",
+                ma.created_at AS "createdAt",
+                ma.image_id AS "imageId"
+            FROM visits v
+            JOIN patients p ON p.user_id = v.patient_id
+            JOIN mri_assessments ma ON ma.assessment_id = v.mri_assessment_id
+            WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+              AND v.image_id = $2
+            ORDER BY v.exam_date DESC NULLS LAST, v.created_at DESC
+            LIMIT 1
+            """,
+            lookup_tokens,
+            parsed_image_id,
+        )
+        if visit_row:
+            return dict(visit_row)
+
+        image_row = await db.fetchrow(
+            """
+            SELECT
+                ma.assessment_id AS "assessmentId",
+                ma.ai_analysis AS "aiAnalysis",
+                COALESCE(
+                    ma.ai_analysis->>'preprocessedObjectPath',
+                    ma.ai_analysis->>'preprocessed_path',
+                    ma.file_path
+                ) AS "filePath",
+                ma.scan_date AS "scanDate",
+                ma.created_at AS "createdAt",
+                ma.image_id AS "imageId"
+            FROM mri_assessments ma
+            JOIN patients p ON p.user_id = ma.patient_id
+            WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+              AND ma.image_id = $2
+            ORDER BY ma.scan_date DESC NULLS LAST, ma.created_at DESC
+            LIMIT 1
+            """,
+            lookup_tokens,
+            parsed_image_id,
+        )
+        if image_row:
+            return dict(image_row)
+
+    parsed_visit_exam_date: Optional[date] = None
+    if raw_visit_exam_date:
+        date_part = raw_visit_exam_date[:10]
+        try:
+            parsed_visit_exam_date = date.fromisoformat(date_part)
+        except ValueError:
+            parsed_visit_exam_date = None
+
+    if parsed_visit_exam_date is not None or raw_visit_viscode2:
+        selected_visit_row = await db.fetchrow(
+            """
+            SELECT
+                v.exam_date AS "examDate",
+                v.viscode2 AS "viscode2",
+                v.mri_assessment_id AS "mriAssessmentId"
+            FROM visits v
+            JOIN patients p ON p.user_id = v.patient_id
+            WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+              AND ($2::date IS NULL OR v.exam_date = $2::date)
+              AND ($3::text IS NULL OR lower(COALESCE(v.viscode2, '')) = $3::text)
+            ORDER BY v.exam_date DESC NULLS LAST, v.created_at DESC
+            LIMIT 1
+            """,
+            lookup_tokens,
+            parsed_visit_exam_date,
+            raw_visit_viscode2 or None,
+        )
+
+        selected_visit = dict(selected_visit_row) if selected_visit_row else {}
+        selected_visit_assessment_id = selected_visit.get("mriAssessmentId")
+        selected_visit_exam_day = selected_visit.get("examDate")
+        if selected_visit_assessment_id:
+            linked_assessment_row = await db.fetchrow(
+                """
+                SELECT
+                    ma.assessment_id AS "assessmentId",
+                    ma.ai_analysis AS "aiAnalysis",
+                    COALESCE(
+                        ma.ai_analysis->>'preprocessedObjectPath',
+                        ma.ai_analysis->>'preprocessed_path',
+                        ma.file_path
+                    ) AS "filePath",
+                    ma.scan_date AS "scanDate",
+                    ma.created_at AS "createdAt",
+                    ma.image_id AS "imageId"
+                FROM mri_assessments ma
+                JOIN patients p ON p.user_id = ma.patient_id
+                WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+                  AND ma.assessment_id = $2
+                LIMIT 1
+                """,
+                lookup_tokens,
+                selected_visit_assessment_id,
+            )
+            if linked_assessment_row:
+                return dict(linked_assessment_row)
+
+        nearest_target_date = selected_visit_exam_day or parsed_visit_exam_date
+        if nearest_target_date is not None:
+            nearest_row = await db.fetchrow(
+                """
+                SELECT
+                    ma.assessment_id AS "assessmentId",
+                    ma.ai_analysis AS "aiAnalysis",
+                    COALESCE(
+                        ma.ai_analysis->>'preprocessedObjectPath',
+                        ma.ai_analysis->>'preprocessed_path',
+                        ma.file_path
+                    ) AS "filePath",
+                    ma.scan_date AS "scanDate",
+                    ma.created_at AS "createdAt",
+                    ma.image_id AS "imageId"
+                FROM mri_assessments ma
+                JOIN patients p ON p.user_id = ma.patient_id
+                WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+                ORDER BY
+                  ABS(EXTRACT(EPOCH FROM (COALESCE(ma.scan_date, ma.created_at) - $2::timestamp))) ASC,
+                  ma.scan_date DESC NULLS LAST,
+                  ma.created_at DESC
+                LIMIT 1
+                """,
+                lookup_tokens,
+                datetime.combine(nearest_target_date, datetime.min.time()),
+            )
+            if nearest_row:
+                return dict(nearest_row)
+
+    latest_row = await db.fetchrow(
+        """
+        SELECT
+            ma.assessment_id AS "assessmentId",
+            ma.ai_analysis AS "aiAnalysis",
+            COALESCE(
+                ma.ai_analysis->>'preprocessedObjectPath',
+                ma.ai_analysis->>'preprocessed_path',
+                ma.file_path
+            ) AS "filePath",
+            ma.scan_date AS "scanDate",
+            ma.created_at AS "createdAt",
+            ma.image_id AS "imageId"
+        FROM mri_assessments ma
+        JOIN patients p ON p.user_id = ma.patient_id
+        WHERE (p.subject_id = ANY($1::text[]) OR p.user_id::text = ANY($1::text[]))
+        ORDER BY ma.scan_date DESC NULLS LAST, ma.created_at DESC
+        LIMIT 1
+        """,
+        lookup_tokens,
+    )
+    return dict(latest_row) if latest_row else None
+
+
 def _try_read_nifti_bytes_from_reference(reference: Any, default_bucket: str = "mri-preprocessed") -> Optional[bytes]:
     raw = str(reference or "").strip()
     if not raw:
@@ -1280,7 +1510,11 @@ async def get_patient(patient_id: str):
     # 4. Visits
     visits = await db.fetch(
         """
-        SELECT exam_date as "examDate", viscode2 as "viscode2", image_id as "imageId"
+        SELECT
+            exam_date as "examDate",
+            viscode2 as "viscode2",
+            image_id as "imageId",
+            mri_assessment_id as "mriAssessmentId"
         FROM visits
         WHERE patient_id = $1
         ORDER BY exam_date ASC NULLS LAST, created_at ASC
@@ -1685,9 +1919,17 @@ async def get_attention_map_png(
 
     ai_analysis = _as_dict(dict(row).get("aiAnalysis")) if row else {}
     if ai_analysis:
-        resolved = _resolve_attention_map_object(ai_analysis, plane=requested_plane, slide_index=slide)
+        resolved = _resolve_attention_map_object(
+            ai_analysis,
+            plane=requested_plane,
+            slide_index=slide,
+        )
         if not resolved and requested_plane != "axial":
-            resolved = _resolve_attention_map_object(ai_analysis, plane="axial", slide_index=slide)
+            resolved = _resolve_attention_map_object(
+                ai_analysis,
+                plane="axial",
+                slide_index=slide,
+            )
         if resolved:
             bucket, key = resolved
             response = None
@@ -1709,7 +1951,10 @@ async def get_attention_map_png(
                     response.release_conn()
 
     # Fallback for rows without CAM artifacts.
-    return await get_preprocessed_nifti_slice_png(patient_id, plane=requested_plane)
+    return await get_preprocessed_nifti_slice_png(
+        patient_id=patient_id,
+        plane=requested_plane,
+    )
 
 
 @router.get("/patients/{patient_id}/mri/original-slice.png")
@@ -1719,6 +1964,7 @@ async def get_original_nifti_slice_png(
 ):
     """Render representative original MRI slice for the requested plane and return PNG bytes."""
     subject_id = await _resolve_subject_id(patient_id)
+
     nii_path = _get_or_build_original_nifti(subject_id)
 
     try:

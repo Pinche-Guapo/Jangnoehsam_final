@@ -136,7 +136,9 @@ async def _fetch_patient_model_context(patient_id: int) -> Dict[str, Any]:
     try:
         patient_row = await db.fetchrow(
             """
-            SELECT COALESCE(risk_level, '') AS risk_level
+            SELECT
+                COALESCE(risk_level, '') AS risk_level,
+                COALESCE(mci_subtype, '') AS mci_subtype
             FROM patients
             WHERE user_id = $1
             """,
@@ -146,6 +148,7 @@ async def _fetch_patient_model_context(patient_id: int) -> Dict[str, Any]:
         logger.exception("Failed to read patient risk_level for patient_id=%s", patient_id)
         return {}
     risk_level = _normalize_text(patient_row["risk_level"]) if patient_row else ""
+    mci_subtype = _normalize_text(patient_row["mci_subtype"]) if patient_row else ""
 
     try:
         mri_row = await db.fetchrow(
@@ -175,6 +178,8 @@ async def _fetch_patient_model_context(patient_id: int) -> Dict[str, Any]:
     payload: Dict[str, Any] = {}
     if risk_level:
         payload["risk_level"] = risk_level
+    if mci_subtype:
+        payload["mci_subtype"] = mci_subtype
 
     if not mri_row:
         return payload
@@ -191,7 +196,7 @@ async def _fetch_patient_model_context(patient_id: int) -> Dict[str, Any]:
     for region_key in neuro_pattern:
         recommended_training.extend(NEURO_REGION_TRAINING_HINTS.get(region_key, []))
 
-    stage = _normalize_text(row.get("classification") or row.get("predicted_stage"))
+    stage = _normalize_text(row.get("classification") or row.get("predicted_stage") or mci_subtype)
     if stage:
         payload["stage"] = stage
     if neuro_pattern:
@@ -230,6 +235,7 @@ def _build_effective_model_result(
     for key in (
         "stage",
         "risk_level",
+        "mci_subtype",
         "neuro_pattern",
         "main_region",
         "region_scores",

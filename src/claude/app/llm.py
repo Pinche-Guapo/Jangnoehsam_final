@@ -81,6 +81,7 @@ class LLMService:
     def _build_model_context(self, patient_stage: str, model_result: Optional[Dict[str, Any]]) -> str:
         stage = self._normalize_text(patient_stage)
         result = dict(model_result or {})
+        mci_subtype = self._normalize_text(result.get("mci_subtype"))
         risk_level = self._normalize_text(result.get("risk_level"))
         main_region = self._normalize_text(result.get("main_region"))
         neuro_pattern = self._list_from_any(result.get("neuro_pattern"))
@@ -93,6 +94,8 @@ class LLMService:
             region_labels = [self._region_label(main_region)]
 
         lines = [f"환자의 현재 상태: {stage or 'unknown'}"]
+        if mci_subtype:
+            lines.append(f"MCI 세부단계: {mci_subtype}")
         if risk_level:
             lines.append(f"위험도: {risk_level}")
         if region_labels:

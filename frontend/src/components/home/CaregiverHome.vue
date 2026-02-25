@@ -14,10 +14,16 @@ const { trend, error: trendError, fetchWeeklyTrend } = useWeeklyTrend();
 const sharing = useCaregiverSharingSettings();
 const selectedRange = ref('7d');
 
-const fetchTrend = async () => fetchWeeklyTrend(buildTrendQueryForRange(selectedRange.value));
+const fetchTrend = async (subjectId) =>
+  fetchWeeklyTrend(
+    buildTrendQueryForRange(selectedRange.value, subjectId ? { subjectId: String(subjectId) } : {})
+  );
 
 onMounted(() => {
-  Promise.all([fetchData(), fetchTrend()]);
+  (async () => {
+    await fetchData();
+    await fetchTrend(data.value?.subject?.id);
+  })();
 });
 
 const statusTone = computed(() => {
