@@ -966,6 +966,11 @@ const dataAvailability = computed<DataAvailability>(() => {
 });
 
 const odonggunSliceSliderEnabled = computed(() => String(currentPatient.value?.id ?? '') === '109');
+const mriSyncEnabled = ref(true);
+
+const toggleMriSync = () => {
+  mriSyncEnabled.value = !mriSyncEnabled.value;
+};
 
 const hasClinicalData = computed(() => dataAvailability.value.hasCognitiveTests);
 const hasVoiceData = computed(() => dataAvailability.value.hasVoiceData);
@@ -2125,6 +2130,16 @@ watch(
               <div class="card mri-images-card">
                 <div class="mri-images-header">
                   <h4>MRI 이미지</h4>
+                  <button
+                    type="button"
+                    class="mri-sync-toggle"
+                    :aria-pressed="mriSyncEnabled"
+                    :aria-label="mriSyncEnabled ? '원본/Attention 동기 이동 끄기' : '원본/Attention 동기 이동 켜기'"
+                    :title="mriSyncEnabled ? '동기 이동 켜짐' : '동기 이동 꺼짐'"
+                    @click="toggleMriSync"
+                  >
+                    {{ mriSyncEnabled ? '🔗' : '⛓️‍💥' }}
+                  </button>
                 </div>
                 <MRIImageDisplay
                   :original-image="originalImage"
@@ -2134,6 +2149,7 @@ watch(
                   :attention-slides="attentionSlides"
                   :original-slice-slider-enabled="odonggunSliceSliderEnabled"
                   :attention-slice-slider-enabled="odonggunSliceSliderEnabled"
+                  :sync-navigation="mriSyncEnabled"
                   :loading="isLoading"
                 />
                 <div v-if="visitOptions.length > 0" class="visit-selector-row">
@@ -3061,12 +3077,27 @@ watch(
 .mri-images-header {
   display: flex;
   align-items: center;
-  justify-content: flex-start;
+  justify-content: space-between;
   gap: 12px;
 }
 
 .mri-images-card h4 {
   margin-bottom: 4px;
+}
+
+.mri-sync-toggle {
+  width: 44px;
+  height: 44px;
+  border-radius: 999px;
+  border: 1px solid #bfd0e1;
+  background: #f5f8fb;
+  box-shadow: inset 2px 2px 5px rgba(209, 217, 230, 0.45), inset -2px -2px 5px #ffffff;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
 }
 
 .contribution-card {
