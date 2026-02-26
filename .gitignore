@@ -19,6 +19,7 @@ minio-data/
 models/
 data/
 migrations/
+scripts/
 
 # Local tooling state
 .claude/
