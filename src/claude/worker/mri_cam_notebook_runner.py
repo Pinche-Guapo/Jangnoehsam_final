@@ -278,6 +278,7 @@ def _save_roi_plane_overlay(
     cam_np: np.ndarray,
     brain_mask: np.ndarray,
     center: List[int],
+    roi_sigma: float,
     plane: str,
     output_path: Path,
 ) -> int:
@@ -298,6 +299,24 @@ def _save_roi_plane_overlay(
                 dtype=np.float32,
             )
 
+    safe_center = [
+        int(np.clip(int(center[0]) if len(center) > 0 else volume_np.shape[0] // 2, 0, volume_np.shape[0] - 1)),
+        int(np.clip(int(center[1]) if len(center) > 1 else volume_np.shape[1] // 2, 0, volume_np.shape[1] - 1)),
+        int(np.clip(int(center[2]) if len(center) > 2 else volume_np.shape[2] // 2, 0, volume_np.shape[2] - 1)),
+    ]
+    sigma = max(float(roi_sigma or 6.0), 1.0)
+    zz, yy, xx = np.indices(volume_np.shape, dtype=np.float32)
+    dist2 = (
+        ((zz - float(safe_center[0])) / sigma) ** 2
+        + ((yy - float(safe_center[1])) / sigma) ** 2
+        + ((xx - float(safe_center[2])) / sigma) ** 2
+    )
+    roi_weight = np.exp(-0.5 * dist2).astype(np.float32)
+    roi_weight = np.where(dist2 <= 6.25, roi_weight, 0.0).astype(np.float32)
+    roi_cam = np.maximum(cam_np, 0.0) * roi_weight
+    if float(np.max(roi_cam)) <= 0.0:
+        roi_cam = np.maximum(cam_np, 0.0) * mask_for_profile
+
     # Slice mode:
     # - cam_peak: chooses the slice with strongest/highest CAM occupancy.
     # - safe_mid: midpoint of foreground bounds.
@@ -307,7 +326,7 @@ def _save_roi_plane_overlay(
     if slice_mode == "safe_mid":
         safe_index = safe_mid_index
     else:
-        safe_index = _cam_peak_index(cam_np, mask_for_profile, dim)
+        safe_index = _cam_peak_index(roi_cam, mask_for_profile, dim)
         if safe_index is None:
             safe_index = safe_mid_index
 
@@ -325,13 +344,13 @@ def _save_roi_plane_overlay(
         mask_2d = mask_for_profile[:, :, safe_index]
 
     if dim == 0:
-        heat = cam_np[safe_index, :, :]
+        heat = roi_cam[safe_index, :, :]
     elif dim == 1:
-        heat = cam_np[:, safe_index, :]
+        heat = roi_cam[:, safe_index, :]
     else:
-        heat = cam_np[:, :, safe_index]
+        heat = roi_cam[:, :, safe_index]
 
-    threshold = float(runtime["percentile_in_mask"](cam_np, brain_mask, 95, fallback=0.5))
+    threshold = float(runtime["percentile_in_mask"](roi_cam, brain_mask, 90, fallback=0.5))
     heat_masked = runtime["_mask_heat"](heat, threshold, mask_2d)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -419,6 +438,7 @@ def generate_attention_from_notebook(
             roi_score = float(roi_item.get("score") or 0.0)
             roi_info = runtime["ROI_DEFINITIONS"].get(roi_name, {})
             roi_center = [int(v) for v in roi_info.get("center", [48, 56, 48])]
+            roi_sigma = float(roi_info.get("sigma", 6.0))
             roi_percentage = (max(roi_score, 0.0) / total_score * 100.0) if total_score > 0 else 0.0
 
             local_paths: Dict[str, str] = {}
@@ -439,6 +459,7 @@ def generate_attention_from_notebook(
                     cam_np=cam_np,
                     brain_mask=brain_mask,
                     center=roi_center,
+                    roi_sigma=roi_sigma,
                     plane=plane,
                     output_path=image_path,
                 )

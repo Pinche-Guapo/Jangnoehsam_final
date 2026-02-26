@@ -883,18 +883,30 @@ def _apply_axial_slice_shift(index: int, depth: int) -> int:
     return shifted
 
 
-def _extract_plane_slice_uint8(nifti_bytes: bytes, plane: str = "axial"):
+def _extract_plane_slice_uint8(
+    nifti_bytes: bytes,
+    plane: str = "axial",
+    slice_percent: float | None = None,
+):
     volume = _parse_nifti_volume_float32(nifti_bytes)
     target_plane = _normalize_plane_name(plane)
 
+    def _axis_index(length: int) -> int:
+        if length <= 1:
+            return 0
+        if slice_percent is None:
+            return length // 2
+        ratio = max(0.0, min(1.0, float(slice_percent)))
+        return int(round(ratio * (length - 1)))
+
     if target_plane == "coronal":
-        idx = volume.shape[1] // 2
+        idx = _axis_index(volume.shape[1])
         return _normalize_slice_uint8(volume[:, idx, :])
     if target_plane == "sagittal":
-        idx = volume.shape[2] // 2
+        idx = _axis_index(volume.shape[2])
         return _normalize_slice_uint8(volume[:, :, idx])
 
-    idx = volume.shape[0] // 2
+    idx = _axis_index(volume.shape[0])
     return _normalize_slice_uint8(volume[idx, :, :])
 
 
@@ -1898,6 +1910,7 @@ async def get_attention_map_png(
     patient_id: str,
     plane: str = Query("axial", description="axial | coronal | sagittal"),
     slide: int = Query(1, ge=1, le=50, description="ROI slide index (1-based)"),
+    slice_index: int | None = Query(None, ge=0, le=100, description="Slice position 0..100"),
 ):
     """Return latest CAM attention map image from ai_analysis, with preprocessed-slice fallback."""
     requested_plane = _normalize_plane_name(plane)
@@ -1919,16 +1932,23 @@ async def get_attention_map_png(
 
     ai_analysis = _as_dict(dict(row).get("aiAnalysis")) if row else {}
     if ai_analysis:
+        target_slide = slide
+        if slice_index is not None:
+            raw_slides = ai_analysis.get("attentionSlides")
+            if isinstance(raw_slides, list) and len(raw_slides) > 1:
+                ratio = max(0.0, min(1.0, float(slice_index) / 100.0))
+                target_slide = int(round(ratio * (len(raw_slides) - 1))) + 1
+
         resolved = _resolve_attention_map_object(
             ai_analysis,
             plane=requested_plane,
-            slide_index=slide,
+            slide_index=target_slide,
         )
         if not resolved and requested_plane != "axial":
             resolved = _resolve_attention_map_object(
                 ai_analysis,
                 plane="axial",
-                slide_index=slide,
+                slide_index=target_slide,
             )
         if resolved:
             bucket, key = resolved
@@ -1954,6 +1974,7 @@ async def get_attention_map_png(
     return await get_preprocessed_nifti_slice_png(
         patient_id=patient_id,
         plane=requested_plane,
+        slice_index=slice_index,
     )
 
 
@@ -1961,6 +1982,7 @@ async def get_attention_map_png(
 async def get_original_nifti_slice_png(
     patient_id: str,
     plane: str = Query("axial", description="axial | coronal | sagittal"),
+    slice_index: int | None = Query(None, ge=0, le=100, description="Slice position 0..100"),
 ):
     """Render representative original MRI slice for the requested plane and return PNG bytes."""
     subject_id = await _resolve_subject_id(patient_id)
@@ -1969,6 +1991,7 @@ async def get_original_nifti_slice_png(
 
     try:
         target_plane = _normalize_plane_name(plane)
+        slice_percent = (float(slice_index) / 100.0) if slice_index is not None else None
         raw_original_nifti = _read_nifti_bytes(nii_path) if nii_path else None
         if raw_original_nifti is None:
             raise HTTPException(
@@ -1976,7 +1999,15 @@ async def get_original_nifti_slice_png(
                 detail=f"Original MRI source not found for subject_id={subject_id}",
             )
 
-        if nii_path and target_plane == "axial":
+        if slice_percent is not None:
+            image_2d = _extract_plane_slice_uint8(
+                raw_original_nifti,
+                target_plane,
+                slice_percent=slice_percent,
+            )
+            if target_plane in ("coronal", "sagittal"):
+                image_2d = image_2d[::-1, ::-1].copy()
+        elif nii_path and target_plane == "axial":
             raw_preprocessed_nifti = await _resolve_preprocessed_nifti_bytes(patient_id, subject_id)
             if raw_preprocessed_nifti is not None:
                 image_2d = _find_aligned_original_slice_uint8(
@@ -2007,6 +2038,7 @@ async def get_original_nifti_slice_png(
 async def get_preprocessed_nifti_slice_png(
     patient_id: str,
     plane: str = Query("axial", description="axial | coronal | sagittal"),
+    slice_index: int | None = Query(None, ge=0, le=100, description="Slice position 0..100"),
 ):
     """Render representative slice from preprocessed NIfTI and return PNG bytes."""
     subject_id = await _resolve_subject_id(patient_id)
@@ -2016,7 +2048,8 @@ async def get_preprocessed_nifti_slice_png(
 
     try:
         target_plane = _normalize_plane_name(plane)
-        image_2d = _extract_plane_slice_uint8(raw_nifti, target_plane)
+        slice_percent = (float(slice_index) / 100.0) if slice_index is not None else None
+        image_2d = _extract_plane_slice_uint8(raw_nifti, target_plane, slice_percent=slice_percent)
         # 1) 원본 방향과 맞추기 위해 180도 회전
         # 2) 사이드 빈공간 색칠은 비활성화 (원본 보존)
         import numpy as np

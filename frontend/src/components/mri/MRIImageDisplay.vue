@@ -38,7 +38,8 @@ const props = defineProps<{
   attentionMap?: string;
   attentionMaps?: AttentionMapInput[];
   attentionSlides?: AttentionSlideInput[];
-  viewSyncEnabled?: boolean;
+  originalSliceSliderEnabled?: boolean;
+  attentionSliceSliderEnabled?: boolean;
   loading?: boolean;
 }>();
 
@@ -47,7 +48,8 @@ const failedAttentionUrls = ref<string[]>([]);
 const selectedSlideIndex = ref(0);
 const selectedViewIndex = ref(0);
 const selectedOriginalViewIndex = ref(0);
-const isViewSyncEnabled = computed(() => props.viewSyncEnabled !== false);
+const originalSliceIndexPercent = ref(50);
+const attentionSliceIndexPercent = ref(50);
 
 const planeOrder: Record<AttentionMapItem['plane'], number> = {
   axial: 0,
@@ -94,6 +96,24 @@ const parseMapItems = (maps: AttentionMapInput[]) => {
   return Array.from(uniqueByPlane.values()).sort(
     (a, b) => planeOrder[a.plane] - planeOrder[b.plane]
   );
+};
+
+const upsertQueryParam = (url: string, key: string, value: string) => {
+  const raw = String(url || '').trim();
+  if (!raw || !key) return raw;
+  const encodedValue = encodeURIComponent(String(value));
+  const matcher = new RegExp(`([?&]${key}=)[^&]*`, 'i');
+  if (matcher.test(raw)) {
+    return raw.replace(matcher, `$1${encodedValue}`);
+  }
+  return `${raw}${raw.includes('?') ? '&' : '?'}${key}=${encodedValue}`;
+};
+
+const appendSliceIndex = (url: string, enabled: boolean | undefined, percent: number) => {
+  const raw = String(url || '').trim();
+  if (!raw) return '';
+  if (!enabled) return raw;
+  return upsertQueryParam(raw, 'slice_index', String(percent));
 };
 
 const fallbackAttentionMaps = computed<AttentionMapItem[]>(() => {
@@ -174,27 +194,27 @@ const currentAttentionView = computed<AttentionMapItem | null>(() => {
 
 const currentOriginalView = computed<AttentionMapItem | null>(() => {
   if (!fallbackOriginalMaps.value.length) return null;
-
-  if (isViewSyncEnabled.value) {
-    const targetPlane = currentAttentionView.value?.plane;
-    if (targetPlane) {
-      const matched = fallbackOriginalMaps.value.find((item) => item.plane === targetPlane);
-      if (matched) return matched;
-    }
-
-    const syncIndex = Math.min(
-      Math.max(selectedViewIndex.value, 0),
-      fallbackOriginalMaps.value.length - 1
-    );
-    return fallbackOriginalMaps.value[syncIndex] || fallbackOriginalMaps.value[0];
-  }
-
   const index = Math.min(
     Math.max(selectedOriginalViewIndex.value, 0),
     fallbackOriginalMaps.value.length - 1
   );
   return fallbackOriginalMaps.value[index] || fallbackOriginalMaps.value[0];
 });
+
+const currentOriginalUrl = computed(() =>
+  appendSliceIndex(
+    currentOriginalView.value?.url || '',
+    props.originalSliceSliderEnabled,
+    originalSliceIndexPercent.value
+  )
+);
+const currentAttentionUrl = computed(() =>
+  appendSliceIndex(
+    currentAttentionView.value?.url || '',
+    props.attentionSliceSliderEnabled,
+    attentionSliceIndexPercent.value
+  )
+);
 
 watch(
   () =>
@@ -243,23 +263,6 @@ watch(
 );
 
 watch(
-  isViewSyncEnabled,
-  (enabled, previous) => {
-    if (enabled || !previous) return;
-    const targetPlane = currentAttentionView.value?.plane;
-    if (!targetPlane) {
-      selectedOriginalViewIndex.value = Math.min(
-        Math.max(selectedViewIndex.value, 0),
-        Math.max(fallbackOriginalMaps.value.length - 1, 0)
-      );
-      return;
-    }
-    const matchedIndex = fallbackOriginalMaps.value.findIndex((item) => item.plane === targetPlane);
-    selectedOriginalViewIndex.value = matchedIndex >= 0 ? matchedIndex : 0;
-  }
-);
-
-watch(
   () => attentionViews.value.length,
   (length) => {
     if (!length) {
@@ -274,11 +277,9 @@ watch(
 );
 
 const hasOriginalImage = (url: string) => Boolean(url && !failedOriginalUrls.value.includes(url));
-const hasOriginal = computed(() => Boolean(currentOriginalView.value?.url) && hasOriginalImage(currentOriginalView.value?.url || ''));
+const hasOriginal = computed(() => Boolean(currentOriginalUrl.value) && hasOriginalImage(currentOriginalUrl.value));
 const hasAttentionViewPaging = computed(() => attentionViews.value.length > 1);
-const hasOriginalViewPaging = computed(() => {
-  return isViewSyncEnabled.value ? hasAttentionViewPaging.value : fallbackOriginalMaps.value.length > 1;
-});
+const hasOriginalViewPaging = computed(() => fallbackOriginalMaps.value.length > 1);
 const attentionViewPositionLabel = computed(() => {
   const total = attentionViews.value.length || fallbackOriginalMaps.value.length;
   if (!total) return '0 / 0';
@@ -286,7 +287,6 @@ const attentionViewPositionLabel = computed(() => {
   return `${current} / ${total}`;
 });
 const originalViewPositionLabel = computed(() => {
-  if (isViewSyncEnabled.value) return attentionViewPositionLabel.value;
   const total = fallbackOriginalMaps.value.length;
   if (!total) return '0 / 0';
   const current = Math.min(Math.max(selectedOriginalViewIndex.value, 0), total - 1) + 1;
@@ -322,20 +322,12 @@ const goNextAttentionView = () => {
 };
 
 const goPrevOriginalView = () => {
-  if (isViewSyncEnabled.value) {
-    goPrevAttentionView();
-    return;
-  }
   const total = fallbackOriginalMaps.value.length;
   if (!total) return;
   selectedOriginalViewIndex.value = (selectedOriginalViewIndex.value - 1 + total) % total;
 };
 
 const goNextOriginalView = () => {
-  if (isViewSyncEnabled.value) {
-    goNextAttentionView();
-    return;
-  }
   const total = fallbackOriginalMaps.value.length;
   if (!total) return;
   selectedOriginalViewIndex.value = (selectedOriginalViewIndex.value + 1) % total;
@@ -354,11 +346,11 @@ const goNextOriginalView = () => {
           </div>
           <template v-else-if="hasOriginal && currentOriginalView">
             <img
-              :key="`original-${currentOriginalView.plane}-${currentOriginalView.url}`"
-              :src="currentOriginalView.url"
+              :key="`original-${currentOriginalView.plane}-${currentOriginalUrl}`"
+              :src="currentOriginalUrl"
               :alt="`Original MRI ${currentOriginalView.label}`"
               loading="lazy"
-              @error="handleOriginalError(currentOriginalView.url)"
+              @error="handleOriginalError(currentOriginalUrl)"
             />
           </template>
           <div v-else class="image-placeholder">
@@ -389,6 +381,19 @@ const goNextOriginalView = () => {
             ›
           </button>
         </div>
+        <div v-if="originalSliceSliderEnabled" class="slice-slider-row">
+          <label class="slice-slider-label" for="mri-slice-index-original">슬라이스</label>
+          <input
+            id="mri-slice-index-original"
+            v-model.number="originalSliceIndexPercent"
+            class="slice-slider-input"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="slice-slider-value">{{ originalSliceIndexPercent }}%</span>
+        </div>
       </div>
 
       <div class="image-card attention-card">
@@ -397,16 +402,16 @@ const goNextOriginalView = () => {
           <div v-if="loading" class="image-placeholder loading">
             <div class="spinner"></div>
           </div>
-          <template v-else-if="currentAttentionView && hasViewImage(currentAttentionView.url)">
+          <template v-else-if="currentAttentionView && hasViewImage(currentAttentionUrl)">
             <img
-              :key="`attention-${currentAttentionView.plane}-${currentAttentionView.url}`"
+              :key="`attention-${currentAttentionView.plane}-${currentAttentionUrl}`"
               :class="{
                 'attention-rotated': true
               }"
-              :src="currentAttentionView.url"
+              :src="currentAttentionUrl"
               :alt="`Attention Map ${currentAttentionView.label}`"
               loading="lazy"
-              @error="handleAttentionError(currentAttentionView.url)"
+              @error="handleAttentionError(currentAttentionUrl)"
             />
           </template>
           <div v-else class="image-placeholder">
@@ -436,6 +441,19 @@ const goNextOriginalView = () => {
           >
             ›
           </button>
+        </div>
+        <div v-if="attentionSliceSliderEnabled" class="slice-slider-row">
+          <label class="slice-slider-label" for="mri-slice-index-attention">슬라이스</label>
+          <input
+            id="mri-slice-index-attention"
+            v-model.number="attentionSliceIndexPercent"
+            class="slice-slider-input"
+            type="range"
+            min="0"
+            max="100"
+            step="1"
+          />
+          <span class="slice-slider-value">{{ attentionSliceIndexPercent }}%</span>
         </div>
       </div>
     </div>
@@ -592,5 +610,36 @@ const goNextOriginalView = () => {
   .image-grid {
     grid-template-columns: 1fr;
   }
+}
+
+.slice-slider-row {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: #f3f6fb;
+  border: 1px solid #e2e8f0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.slice-slider-label {
+  font-size: 12px;
+  font-weight: 800;
+  color: #6b7280;
+  min-width: 40px;
+}
+
+.slice-slider-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.slice-slider-value {
+  font-size: 12px;
+  font-weight: 800;
+  color: #6b7280;
+  min-width: 44px;
+  text-align: right;
 }
 </style>

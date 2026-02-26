@@ -704,7 +704,11 @@ const isNotebookAttentionLayout = computed(() => {
 });
 
 const resolveAttentionStoragePlane = (plane: AttentionMapItem['plane']): AttentionMapItem['plane'] => {
-  // Backend now returns canonical plane mapping, so keep frontend mapping identity.
+  // Notebook CAM outputs were generated with axial/sagittal swapped.
+  if (isNotebookAttentionLayout.value) {
+    if (plane === 'axial') return 'sagittal';
+    if (plane === 'sagittal') return 'axial';
+  }
   return plane;
 };
 
@@ -961,17 +965,7 @@ const dataAvailability = computed<DataAvailability>(() => {
   };
 });
 
-const mriViewSyncEnabled = ref(true);
-const mriViewSyncIcon = computed(() => (mriViewSyncEnabled.value ? '🔗' : '⛓️‍💥'));
-const mriViewSyncButtonLabel = computed(() =>
-  mriViewSyncEnabled.value
-    ? '현재: 슬라이드 같이 넘어가기. 클릭하면 따로 넘어가기로 전환'
-    : '현재: 슬라이드 따로 넘어가기. 클릭하면 같이 넘어가기로 전환'
-);
-
-const toggleMriViewSync = () => {
-  mriViewSyncEnabled.value = !mriViewSyncEnabled.value;
-};
+const odonggunSliceSliderEnabled = computed(() => String(currentPatient.value?.id ?? '') === '109');
 
 const hasClinicalData = computed(() => dataAvailability.value.hasCognitiveTests);
 const hasVoiceData = computed(() => dataAvailability.value.hasVoiceData);
@@ -2131,15 +2125,6 @@ watch(
               <div class="card mri-images-card">
                 <div class="mri-images-header">
                   <h4>MRI 이미지</h4>
-                  <button
-                    type="button"
-                    class="mri-sync-toggle"
-                    :aria-label="mriViewSyncButtonLabel"
-                    :title="mriViewSyncButtonLabel"
-                    @click="toggleMriViewSync"
-                  >
-                    {{ mriViewSyncIcon }}
-                  </button>
                 </div>
                 <MRIImageDisplay
                   :original-image="originalImage"
@@ -2147,7 +2132,8 @@ watch(
                   :attention-map="attentionMap"
                   :attention-maps="attentionMaps"
                   :attention-slides="attentionSlides"
-                  :view-sync-enabled="mriViewSyncEnabled"
+                  :original-slice-slider-enabled="odonggunSliceSliderEnabled"
+                  :attention-slice-slider-enabled="odonggunSliceSliderEnabled"
                   :loading="isLoading"
                 />
                 <div v-if="visitOptions.length > 0" class="visit-selector-row">
@@ -3075,37 +3061,12 @@ watch(
 .mri-images-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 12px;
 }
 
 .mri-images-card h4 {
   margin-bottom: 4px;
-}
-
-.mri-sync-toggle {
-  width: 42px;
-  height: 42px;
-  border-radius: 999px;
-  border: 1px solid #c8d2dd;
-  background: #f6f8fb;
-  color: #5a6a7f;
-  font-size: 20px;
-  line-height: 1;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  box-shadow: inset 2px 2px 5px rgba(209, 217, 230, 0.6), inset -2px -2px 5px #ffffff;
-}
-
-.mri-sync-toggle:hover {
-  background: #eef3f8;
-}
-
-.mri-sync-toggle:focus-visible {
-  outline: 2px solid #4cb7b7;
-  outline-offset: 2px;
 }
 
 .contribution-card {
