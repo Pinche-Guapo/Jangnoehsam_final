@@ -272,18 +272,8 @@ def _apply_plane_shift(plane: str, index: int, shape: Tuple[int, int, int]) -> i
     return int(np.clip(index + total_shift, 0, depth - 1))
 
 
-def _save_roi_plane_overlay(
-    runtime: Dict[str, Any],
-    volume_np: np.ndarray,
-    cam_np: np.ndarray,
-    brain_mask: np.ndarray,
-    center: List[int],
-    roi_sigma: float,
-    plane: str,
-    output_path: Path,
-) -> int:
-    dim, _ = PLANE_META[plane]
-    # Use a robust foreground profile for slice selection.
+def _build_profile_mask(volume_np: np.ndarray, brain_mask: np.ndarray) -> np.ndarray:
+    """Build a stable foreground mask used for slice indexing."""
     mask_for_profile = np.asarray(brain_mask > 0.0, dtype=np.float32)
     coverage = float(mask_for_profile.mean()) if mask_for_profile.size else 0.0
     if coverage < 0.02 or coverage > 0.98:
@@ -298,6 +288,36 @@ def _save_roi_plane_overlay(
                 volume_np > np.percentile(volume_np, 60),
                 dtype=np.float32,
             )
+    return mask_for_profile
+
+
+def _slice_index_from_percent(mask_for_profile: np.ndarray, dim: int, ratio: float) -> int:
+    ratio = max(0.0, min(1.0, float(ratio)))
+    depth = int(mask_for_profile.shape[dim])
+    coords = np.argwhere(mask_for_profile > 0.0)
+    if coords.size:
+        lo = int(coords[:, dim].min())
+        hi = int(coords[:, dim].max())
+    else:
+        lo, hi = 0, max(0, depth - 1)
+    if hi < lo:
+        lo, hi = hi, lo
+    return int(round(lo + (hi - lo) * ratio))
+
+
+def _save_roi_plane_overlay(
+    runtime: Dict[str, Any],
+    volume_np: np.ndarray,
+    cam_np: np.ndarray,
+    brain_mask: np.ndarray,
+    center: List[int],
+    roi_sigma: float,
+    plane: str,
+    output_path: Path,
+) -> int:
+    dim, _ = PLANE_META[plane]
+    # Use a robust foreground profile for slice selection.
+    mask_for_profile = _build_profile_mask(volume_np, brain_mask)
 
     safe_center = [
         int(np.clip(int(center[0]) if len(center) > 0 else volume_np.shape[0] // 2, 0, volume_np.shape[0] - 1)),
@@ -367,6 +387,51 @@ def _save_roi_plane_overlay(
     return safe_index
 
 
+def _save_dense_plane_overlay(
+    runtime: Dict[str, Any],
+    volume_np: np.ndarray,
+    cam_np: np.ndarray,
+    brain_mask: np.ndarray,
+    plane: str,
+    slice_ratio: float,
+    output_path: Path,
+) -> int:
+    """Save one CAM overlay image for a dense slice position in a given plane."""
+    dim, _ = PLANE_META[plane]
+    mask_for_profile = _build_profile_mask(volume_np, brain_mask)
+    safe_index = _slice_index_from_percent(mask_for_profile, dim, slice_ratio)
+    safe_index = _apply_plane_shift(plane, safe_index, volume_np.shape)
+
+    if dim == 0:
+        base = volume_np[safe_index, :, :]
+        mask_2d = mask_for_profile[safe_index, :, :]
+        heat = np.maximum(cam_np[safe_index, :, :], 0.0)
+    elif dim == 1:
+        base = volume_np[:, safe_index, :]
+        mask_2d = mask_for_profile[:, safe_index, :]
+        heat = np.maximum(cam_np[:, safe_index, :], 0.0)
+    else:
+        base = volume_np[:, :, safe_index]
+        mask_2d = mask_for_profile[:, :, safe_index]
+        heat = np.maximum(cam_np[:, :, safe_index], 0.0)
+
+    threshold = float(runtime["percentile_in_mask"](cam_np, brain_mask, 90, fallback=0.5))
+    heat_masked = runtime["_mask_heat"](heat, threshold, mask_2d)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(4.2, 4.2))
+    try:
+        ax.imshow(base, cmap="gray", interpolation="bilinear")
+        ax.imshow(heat_masked, cmap="turbo", alpha=0.55, vmin=threshold, vmax=1.0, interpolation="bilinear")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        fig.savefig(output_path, dpi=160, bbox_inches="tight", pad_inches=0.02)
+    finally:
+        plt.close(fig)
+
+    return safe_index
+
+
 def generate_attention_from_notebook(
     nifti_path: str,
     output_dir: str,
@@ -374,6 +439,8 @@ def generate_attention_from_notebook(
     final_label: str,
     run_token: str | None = None,
     top_k: int = 5,
+    mode: str = "topk",
+    dense_slices_per_plane: int = 100,
 ) -> Dict[str, Any]:
     runtime = _get_runtime()
 
@@ -431,62 +498,108 @@ def generate_attention_from_notebook(
             logger.warning("Notebook ROI visualization failed (continuing): %s", notebook_vis_exc)
 
         total_score = float(sum(max(float(item["score"]), 0.0) for item in top_rois))
-        slides: List[Dict[str, Any]] = []
-        for rank, roi_item in enumerate(top_rois, start=1):
-            roi_name = str(roi_item.get("name") or f"roi_{rank}")
-            roi_description = str(roi_item.get("description") or roi_name)
+        region_contributions = []
+        for roi_item in top_rois:
+            roi_name = str(roi_item.get("name") or "")
             roi_score = float(roi_item.get("score") or 0.0)
-            roi_info = runtime["ROI_DEFINITIONS"].get(roi_name, {})
-            roi_center = [int(v) for v in roi_info.get("center", [48, 56, 48])]
-            roi_sigma = float(roi_info.get("sigma", 6.0))
             roi_percentage = (max(roi_score, 0.0) / total_score * 100.0) if total_score > 0 else 0.0
-
-            local_paths: Dict[str, str] = {}
-            slice_indices: Dict[str, int] = {}
-            roi_slug = _sanitize_slug(roi_name) or f"roi_{rank}"
-            stage_slug = _sanitize_slug(stage_name) or "stage"
-
-            for plane in PLANE_ORDER:
-                image_name = (
-                    f"{_sanitize_slug(subject_token) or 'subject'}_"
-                    f"{_sanitize_slug(run_tag) or 'latest'}_"
-                    f"{stage_slug}_r{rank:02d}_{roi_slug}_{plane}.png"
-                )
-                image_path = out_dir / image_name
-                slice_index = _save_roi_plane_overlay(
-                    runtime=runtime,
-                    volume_np=volume_np,
-                    cam_np=cam_np,
-                    brain_mask=brain_mask,
-                    center=roi_center,
-                    roi_sigma=roi_sigma,
-                    plane=plane,
-                    output_path=image_path,
-                )
-                local_paths[plane] = str(image_path)
-                slice_indices[plane] = int(slice_index)
-
-            slides.append(
+            region_contributions.append(
                 {
-                    "rank": int(rank),
-                    "roi": roi_name,
-                    "description": roi_description,
-                    "score": round(roi_score, 6),
+                    "region": roi_name,
                     "percentage": round(float(roi_percentage), 1),
                     "severity": _severity_from_percentage(float(roi_percentage)),
-                    "sliceIndices": slice_indices,
-                    "local_paths": local_paths,
                 }
             )
 
-        region_contributions = [
-            {
-                "region": item["roi"],
-                "percentage": item["percentage"],
-                "severity": item["severity"],
-            }
-            for item in slides
-        ]
+        slides: List[Dict[str, Any]] = []
+        requested_mode = str(mode or "topk").strip().lower()
+        cam_mode = requested_mode if requested_mode in {"topk", "dense"} else "topk"
+
+        if cam_mode == "dense":
+            dense_count = max(8, int(dense_slices_per_plane or 100))
+            stage_slug = _sanitize_slug(stage_name) or "stage"
+            for rank in range(1, dense_count + 1):
+                ratio = 0.5 if dense_count <= 1 else float(rank - 1) / float(dense_count - 1)
+                local_paths: Dict[str, str] = {}
+                slice_indices: Dict[str, int] = {}
+                for plane in PLANE_ORDER:
+                    image_name = (
+                        f"{_sanitize_slug(subject_token) or 'subject'}_"
+                        f"{_sanitize_slug(run_tag) or 'latest'}_"
+                        f"{stage_slug}_dense_{rank:03d}_{plane}.png"
+                    )
+                    image_path = out_dir / image_name
+                    slice_index = _save_dense_plane_overlay(
+                        runtime=runtime,
+                        volume_np=volume_np,
+                        cam_np=cam_np,
+                        brain_mask=brain_mask,
+                        plane=plane,
+                        slice_ratio=ratio,
+                        output_path=image_path,
+                    )
+                    local_paths[plane] = str(image_path)
+                    slice_indices[plane] = int(slice_index)
+
+                slides.append(
+                    {
+                        "rank": int(rank),
+                        "roi": f"dense_{rank:03d}",
+                        "description": f"Dense slice {rank}/{dense_count}",
+                        "score": 0.0,
+                        "percentage": 0.0,
+                        "severity": "low",
+                        "sliceIndices": slice_indices,
+                        "local_paths": local_paths,
+                    }
+                )
+        else:
+            for rank, roi_item in enumerate(top_rois, start=1):
+                roi_name = str(roi_item.get("name") or f"roi_{rank}")
+                roi_description = str(roi_item.get("description") or roi_name)
+                roi_score = float(roi_item.get("score") or 0.0)
+                roi_info = runtime["ROI_DEFINITIONS"].get(roi_name, {})
+                roi_center = [int(v) for v in roi_info.get("center", [48, 56, 48])]
+                roi_sigma = float(roi_info.get("sigma", 6.0))
+                roi_percentage = (max(roi_score, 0.0) / total_score * 100.0) if total_score > 0 else 0.0
+
+                local_paths: Dict[str, str] = {}
+                slice_indices: Dict[str, int] = {}
+                roi_slug = _sanitize_slug(roi_name) or f"roi_{rank}"
+                stage_slug = _sanitize_slug(stage_name) or "stage"
+
+                for plane in PLANE_ORDER:
+                    image_name = (
+                        f"{_sanitize_slug(subject_token) or 'subject'}_"
+                        f"{_sanitize_slug(run_tag) or 'latest'}_"
+                        f"{stage_slug}_r{rank:02d}_{roi_slug}_{plane}.png"
+                    )
+                    image_path = out_dir / image_name
+                    slice_index = _save_roi_plane_overlay(
+                        runtime=runtime,
+                        volume_np=volume_np,
+                        cam_np=cam_np,
+                        brain_mask=brain_mask,
+                        center=roi_center,
+                        roi_sigma=roi_sigma,
+                        plane=plane,
+                        output_path=image_path,
+                    )
+                    local_paths[plane] = str(image_path)
+                    slice_indices[plane] = int(slice_index)
+
+                slides.append(
+                    {
+                        "rank": int(rank),
+                        "roi": roi_name,
+                        "description": roi_description,
+                        "score": round(roi_score, 6),
+                        "percentage": round(float(roi_percentage), 1),
+                        "severity": _severity_from_percentage(float(roi_percentage)),
+                        "sliceIndices": slice_indices,
+                        "local_paths": local_paths,
+                    }
+                )
 
         roi_scores_ranked = [
             {
@@ -500,6 +613,7 @@ def generate_attention_from_notebook(
         first_local_paths = slides[0]["local_paths"] if slides else {}
         return {
             "method": "GradCAM3D_notebook",
+            "mode": cam_mode,
             "stage": stage_name,
             "targetLabel": target_label,
             "targetClassIndex": int(target_class),

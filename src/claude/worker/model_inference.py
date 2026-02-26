@@ -1052,6 +1052,15 @@ def predict_mri(
         if xai_output_dir:
             try:
                 os.makedirs(xai_output_dir, exist_ok=True)
+                patient_token = str(patient_id or "").strip()
+                cam_mode = "dense" if patient_token == "109" else "topk"
+                dense_slices_per_plane = max(8, _env_int("MRI_CAM_DENSE_SLICES_PER_PLANE", 100))
+                logger.info(
+                    "MRI CAM mode selected: mode=%s patient_id=%s dense_slices_per_plane=%s",
+                    cam_mode,
+                    patient_token or "n/a",
+                    dense_slices_per_plane,
+                )
                 xai_payload = generate_attention_from_notebook(
                     nifti_path=nifti_path,
                     output_dir=xai_output_dir,
@@ -1059,6 +1068,8 @@ def predict_mri(
                     final_label=str(final_label),
                     run_token=str(mri_id or "latest"),
                     top_k=max(1, _env_int("MRI_CAM_TOP_K", 5)),
+                    mode=cam_mode,
+                    dense_slices_per_plane=dense_slices_per_plane,
                 )
             except Exception as xai_exc:
                 logger.warning("Notebook-style MRI CAM generation failed: %s", xai_exc)

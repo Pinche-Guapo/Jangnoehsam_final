@@ -382,7 +382,6 @@ const goNextOriginalView = () => {
           </button>
         </div>
         <div v-if="originalSliceSliderEnabled" class="slice-slider-row">
-          <label class="slice-slider-label" for="mri-slice-index-original">슬라이스</label>
           <input
             id="mri-slice-index-original"
             v-model.number="originalSliceIndexPercent"
@@ -443,7 +442,6 @@ const goNextOriginalView = () => {
           </button>
         </div>
         <div v-if="attentionSliceSliderEnabled" class="slice-slider-row">
-          <label class="slice-slider-label" for="mri-slice-index-attention">슬라이스</label>
           <input
             id="mri-slice-index-attention"
             v-model.number="attentionSliceIndexPercent"
@@ -616,8 +614,8 @@ const goNextOriginalView = () => {
   margin-top: 12px;
   padding: 10px 12px;
   border-radius: 12px;
-  background: #f3f6fb;
-  border: 1px solid #e2e8f0;
+  background: #e9f7f7;
+  border: 1px solid #bfe3e3;
   display: flex;
   align-items: center;
   gap: 10px;
@@ -633,12 +631,48 @@ const goNextOriginalView = () => {
 .slice-slider-input {
   flex: 1;
   min-width: 0;
+  accent-color: #4cb7b7;
+  height: 8px;
+}
+
+.slice-slider-input::-webkit-slider-runnable-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #d9ecec;
+}
+
+.slice-slider-input::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  margin-top: -5px;
+  border-radius: 999px;
+  border: 2px solid #ffffff;
+  background: #3db1b1;
+  box-shadow: 0 2px 8px rgba(61, 177, 177, 0.35);
+}
+
+.slice-slider-input::-moz-range-track {
+  height: 8px;
+  border-radius: 999px;
+  background: #d9ecec;
+  border: none;
+}
+
+.slice-slider-input::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 999px;
+  border: 2px solid #ffffff;
+  background: #3db1b1;
+  box-shadow: 0 2px 8px rgba(61, 177, 177, 0.35);
 }
 
 .slice-slider-value {
   font-size: 12px;
   font-weight: 800;
-  color: #6b7280;
+  color: #2f8488;
   min-width: 44px;
   text-align: right;
 }
