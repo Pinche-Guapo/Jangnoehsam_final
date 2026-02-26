@@ -354,6 +354,17 @@ watch(originalSliceIndexPercent, (value) => {
 });
 
 watch(attentionSliceIndexPercent, (value) => {
+  const attentionSlideCount = resolvedAttentionSlides.value.length;
+  if (attentionSlideCount > 1) {
+    const targetSlideIndex = Math.min(
+      attentionSlideCount - 1,
+      Math.max(0, Math.round((value / 100) * (attentionSlideCount - 1)))
+    );
+    if (targetSlideIndex !== selectedSlideIndex.value) {
+      selectedSlideIndex.value = targetSlideIndex;
+    }
+  }
+
   const prefetchUrl = appendSliceIndex(
     currentAttentionView.value?.url || '',
     props.attentionSliceSliderEnabled,

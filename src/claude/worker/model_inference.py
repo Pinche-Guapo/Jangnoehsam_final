@@ -864,6 +864,7 @@ def _predict_mci_subtype(patient_id: str) -> dict:
 def predict_mri(
     nifti_path: str,
     patient_id: str = None,
+    subject_id: str | None = None,
     mri_id: str | None = None,
     xai_output_dir: str | None = None,
 ) -> dict:
@@ -1053,18 +1054,23 @@ def predict_mri(
             try:
                 os.makedirs(xai_output_dir, exist_ok=True)
                 patient_token = str(patient_id or "").strip()
-                cam_mode = "dense" if patient_token == "109" else "topk"
+                subject_token = str(subject_id or "").strip()
+                forced_mode = os.getenv("MRI_CAM_MODE", "").strip().lower()
+                # Default to dense CAM so slider movement reflects per-slice variation
+                # consistently across demo patients unless explicitly overridden.
+                cam_mode = forced_mode if forced_mode in {"topk", "dense"} else "dense"
                 dense_slices_per_plane = max(8, _env_int("MRI_CAM_DENSE_SLICES_PER_PLANE", 100))
                 logger.info(
-                    "MRI CAM mode selected: mode=%s patient_id=%s dense_slices_per_plane=%s",
+                    "MRI CAM mode selected: mode=%s patient_id=%s subject_id=%s dense_slices_per_plane=%s",
                     cam_mode,
                     patient_token or "n/a",
+                    subject_token or "n/a",
                     dense_slices_per_plane,
                 )
                 xai_payload = generate_attention_from_notebook(
                     nifti_path=nifti_path,
                     output_dir=xai_output_dir,
-                    subject_id=str(patient_id or "patient"),
+                    subject_id=str(subject_token or patient_token or "patient"),
                     final_label=str(final_label),
                     run_token=str(mri_id or "latest"),
                     top_k=max(1, _env_int("MRI_CAM_TOP_K", 5)),

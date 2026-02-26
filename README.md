@@ -10,6 +10,8 @@ Raspberry Pi 5 + Docker Compose 환경에서 동작하는 이중(음성/MRI) 인
 - 원본 ADNI 데이터 파일, 원본 DICOM/NIfTI, 피험자 식별 정보는 README에 기록하지 않습니다.
 - 데이터 스크린샷/샘플 파일/외부 업로드 링크를 문서에 포함하지 않습니다.
 - 실행 예시는 모두 일반화된 경로와 플레이스홀더만 사용합니다.
+- Git 저장소에는 코드/설정/합성(synthetic) 예시만 포함하고, ADNI 원본/파생 산출물은 커밋하지 않습니다.
+- 발표/문서/데모에서는 ADNI 개별 사례를 재식별할 수 있는 정보(식별자, 경로, 메타데이터)를 노출하지 않습니다.
 
 ### 기술 스택
 
@@ -22,6 +24,15 @@ Raspberry Pi 5 + Docker Compose 환경에서 동작하는 이중(음성/MRI) 인
 | Database | PostgreSQL 16 |
 | Object Storage | MinIO |
 | Infra | Docker Compose, Nginx |
+
+### 최신 진행 요약 (2026-02-26 업데이트)
+
+1. 백엔드 인프라를 `FastAPI + Celery + Redis + PostgreSQL + MinIO` 구조로 정리해, 업로드/추론/저장 흐름을 비동기 파이프라인으로 고정했습니다.
+2. MRI 파이프라인은 `ingest -> mri_assessments 생성 -> Celery process_mri_scan -> ANTs 전처리 -> 분류 -> SQL 반영`까지 연결했고, 전처리 결과는 `mri-preprocessed` 버킷 캐시를 사용합니다.
+3. 음성 파이프라인은 세션 API(`/start`, `/chat`, `/session/upload-audio`, `/session/end`)와 연동되며, 세션 산출물은 MinIO + PostgreSQL에 저장되고 조건 충족 시 ML 워커로 자동 enqueue됩니다.
+4. LLM 세션은 `patient_id` 기준 최신 MRI 진단 컨텍스트를 백엔드에서 자동 병합하도록 연결해, 프론트 입력 누락 시에도 환자 맞춤 컨텍스트를 유지합니다.
+5. 운영 안정화를 위해 워커 동시성/스레드 제한, `max-tasks-per-child`, DB/스크립트 KST 타임존 고정 설정을 반영했습니다.
+6. 검증 체계는 소표본 환경에 맞춰 `LOOCV` 중심으로 운영하고, AI-Hub 짧은 세션과 학습 데이터(긴 세션) 간 도메인/길이 차이에 따른 분포 흔들림을 확인해 길이 정합 재학습을 후속 과제로 정의했습니다.
 
 ### 워커 튜닝(안전 설정, 2026-02-22 반영)
 
@@ -82,7 +93,7 @@ docker compose --env-file .env up -d worker
 └── pyproject.toml
 ```
 
-### 지금까지 완료된 핵심 작업 (2026-02-19 기준)
+### 지금까지 완료된 핵심 작업 (2026-02-26 기준)
 
 #### 1) MRI 풀 파이프라인 연결
 

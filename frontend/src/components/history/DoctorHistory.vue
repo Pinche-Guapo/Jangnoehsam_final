@@ -965,7 +965,7 @@ const dataAvailability = computed<DataAvailability>(() => {
   };
 });
 
-const odonggunSliceSliderEnabled = computed(() => String(currentPatient.value?.id ?? '') === '109');
+const mriSliceSliderEnabled = computed(() => dataAvailability.value.hasMRI);
 const mriSyncEnabled = ref(true);
 
 const toggleMriSync = () => {
@@ -1982,7 +1982,7 @@ watch(
             <div v-if="latestVoiceAssessment" class="card voice-result-card">
               <div class="voice-result-header">
                 <div>
-                  <h4>최근 모델 분석 결과</h4>
+                  <h4>최근 음성 분석 결과</h4>
                   <p>가장 최근 완료된 음성 평가 기준</p>
                 </div>
                 <span class="voice-result-badge" :class="`voice-result-${latestVoiceFlagKey}`">
@@ -2147,8 +2147,8 @@ watch(
                   :attention-map="attentionMap"
                   :attention-maps="attentionMaps"
                   :attention-slides="attentionSlides"
-                  :original-slice-slider-enabled="odonggunSliceSliderEnabled"
-                  :attention-slice-slider-enabled="odonggunSliceSliderEnabled"
+                  :original-slice-slider-enabled="mriSliceSliderEnabled"
+                  :attention-slice-slider-enabled="mriSliceSliderEnabled"
                   :sync-navigation="mriSyncEnabled"
                   :loading="isLoading"
                 />

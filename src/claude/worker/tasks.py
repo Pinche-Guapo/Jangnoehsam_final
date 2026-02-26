@@ -725,6 +725,7 @@ def process_mri_scan(self, mri_id: str, patient_id: str, file_path: str):
         mri_result = predict_mri(
             final_path,
             patient_id=patient_id,
+            subject_id=subject_token,
             mri_id=mri_id,
             xai_output_dir=preprocessed_dir,
         )
